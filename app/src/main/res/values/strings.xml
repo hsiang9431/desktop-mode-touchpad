@@ -12,8 +12,8 @@
     <string name="service_status_inactive">Accessibility Service Inactive</string>
     <string name="enable_service_btn">Enable Accessibility Service</string>
     <string name="touchpad_title">Desktop Touchpad</string>
-    <string name="touchpad_hint">1-finger move &amp; tap \u2022 Double-tap &amp; hold to drag\n2-finger scroll &amp; right click\n3-finger tap Back, down Home, up Switch App</string>
-    <string name="touchpad_hint_no_three_finger">1-finger move &amp; tap \u2022 Double-tap &amp; hold to drag\n2-finger scroll &amp; right click \u2022 Tap Keyboard below to type</string>
+    <string name="touchpad_hint">1-finger move &amp; tap \u2022 Tap &amp; hold to drag\n2-finger scroll &amp; right click\n3-finger tap Back, down Home, up Switch App</string>
+    <string name="touchpad_hint_no_three_finger">1-finger move &amp; tap \u2022 Tap &amp; hold to drag\n2-finger scroll &amp; right click \u2022 Tap Keyboard below to type</string>
     <string name="btn_left_click">Click / Drag</string>
     <string name="btn_right_click">Right Click</string>
     <string name="btn_keyboard">Keyboard</string>
@@ -22,7 +22,7 @@
     <string name="btn_center_cursor">Center</string>
     <string name="btn_settings">Options</string>
     <string name="label_sensitivity">Pointer Speed</string>
-    <string name="label_double_tap_interval">Double-Tap Interval</string>
+    <string name="label_tap_hold_delay">Tap &amp; Hold Delay</string>
     <string name="label_natural_scroll">Natural Two-Finger Scroll</string>
     <string name="label_three_finger_gestures">Three-Finger Gestures</string>
     <string name="keyboard_target_header">Send to %1$s</string>

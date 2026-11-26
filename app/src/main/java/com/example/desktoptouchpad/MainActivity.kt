@@ -501,7 +501,7 @@ fun TouchpadScreen(
     var showDisclosure by remember { mutableStateOf(false) }
     var showOptions by remember { mutableStateOf(false) }
     var sensitivity by remember { mutableFloatStateOf(gestureController.sensitivity) }
-    var doubleTapIntervalMs by remember { mutableLongStateOf(gestureController.doubleTapIntervalMs) }
+    var tapHoldDelayMs by remember { mutableLongStateOf(gestureController.tapHoldDelayMs) }
     var naturalScrolling by remember { mutableStateOf(gestureController.naturalScrolling) }
     var threeFingerGesturesEnabled by remember {
         mutableStateOf(gestureController.threeFingerGesturesEnabled)
@@ -560,16 +560,16 @@ fun TouchpadScreen(
                         Spacer(modifier = Modifier.height(8.dp))
                         TouchpadOptionsPanel(
                             sensitivity = sensitivity,
-                            doubleTapIntervalMs = doubleTapIntervalMs,
+                            tapHoldDelayMs = tapHoldDelayMs,
                             naturalScrolling = naturalScrolling,
                             threeFingerGesturesEnabled = threeFingerGesturesEnabled,
                             onSensitivityChange = { value ->
                                 sensitivity = value
                                 gestureController.sensitivity = value
                             },
-                            onDoubleTapIntervalChange = { valueMs ->
-                                doubleTapIntervalMs = valueMs
-                                gestureController.doubleTapIntervalMs = valueMs
+                            onTapHoldDelayChange = { valueMs ->
+                                tapHoldDelayMs = valueMs
+                                gestureController.tapHoldDelayMs = valueMs
                             },
                             onNaturalScrollingChange = { enabled ->
                                 naturalScrolling = enabled
@@ -772,11 +772,11 @@ private fun SmallControlChip(
 @Composable
 private fun TouchpadOptionsPanel(
     sensitivity: Float,
-    doubleTapIntervalMs: Long,
+    tapHoldDelayMs: Long,
     naturalScrolling: Boolean,
     threeFingerGesturesEnabled: Boolean,
     onSensitivityChange: (Float) -> Unit,
-    onDoubleTapIntervalChange: (Long) -> Unit,
+    onTapHoldDelayChange: (Long) -> Unit,
     onNaturalScrollingChange: (Boolean) -> Unit,
     onThreeFingerGesturesChange: (Boolean) -> Unit
 ) {
@@ -823,31 +823,31 @@ private fun TouchpadOptionsPanel(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = stringResource(R.string.label_double_tap_interval),
+                    text = stringResource(R.string.label_tap_hold_delay),
                     color = Color(0xFF9399B2),
                     fontSize = 13.sp
                 )
                 Text(
-                    text = "$doubleTapIntervalMs ms",
+                    text = "$tapHoldDelayMs ms",
                     color = Color(0xFF89B4FA),
                     fontSize = 13.sp,
                     fontWeight = FontWeight.SemiBold
                 )
             }
-            val doubleTapSliderState = rememberSliderState(
-                value = doubleTapIntervalMs.toFloat(),
-                trackRange = GestureController.MIN_DOUBLE_TAP_INTERVAL_MS.toFloat()..
-                    GestureController.MAX_DOUBLE_TAP_INTERVAL_MS.toFloat()
+            val tapHoldSliderState = rememberSliderState(
+                value = tapHoldDelayMs.toFloat(),
+                trackRange = GestureController.MIN_TAP_HOLD_DELAY_MS.toFloat()..
+                    GestureController.MAX_TAP_HOLD_DELAY_MS.toFloat()
             )
             Slider(
-                state = doubleTapSliderState,
+                state = tapHoldSliderState,
                 onValueChange = { rawValue ->
-                    doubleTapSliderState.value = rawValue
+                    tapHoldSliderState.value = rawValue
                     val steppedMs = ((rawValue / 10f).roundToLong() * 10L).coerceIn(
-                        GestureController.MIN_DOUBLE_TAP_INTERVAL_MS,
-                        GestureController.MAX_DOUBLE_TAP_INTERVAL_MS
+                        GestureController.MIN_TAP_HOLD_DELAY_MS,
+                        GestureController.MAX_TAP_HOLD_DELAY_MS
                     )
-                    onDoubleTapIntervalChange(steppedMs)
+                    onTapHoldDelayChange(steppedMs)
                 }
             )
 
@@ -913,20 +913,18 @@ private fun DeXTouchpadSurface(
                 val tapSlopPx = 8.dp.toPx()
                 val scrollSlopPx = 4.dp.toPx()
                 val threeFingerSwipeThresholdPx = 44.dp.toPx()
-                val tapTimeoutMs = 230L
-                val doubleTapHoldDragMs = 170L
-                val longPressDragMs = 420L
-
-                var lastSingleTapUpTime = 0L
+                val multiFingerTapTimeoutMs = 230L
 
                 awaitEachGesture {
                     val firstDown = awaitFirstDown(requireUnconsumed = false)
                     firstDown.consume()
 
+                    val downPos = firstDown.position
                     val downTime = firstDown.uptimeMillis
+                    val tapHoldDelayMs = gestureController.tapHoldDelayMs
                     var lastEventTime = downTime
                     var maxPointerCount = 1
-                    var totalSingleFingerDistance = 0f
+                    var maxSingleFingerDisplacement = 0f
                     var totalTwoFingerDistance = 0f
                     var totalThreeFingerDistance = 0f
                     var isMovingCursor = false
@@ -934,9 +932,6 @@ private fun DeXTouchpadSurface(
                     var dragStartFailed = false
                     var dragPointerId = firstDown.id
                     var threeFingerSwipeTriggered = false
-
-                    val doubleTapWindowMs = gestureController.doubleTapIntervalMs
-                    val isQuickSecondTouch = (downTime - lastSingleTapUpTime) in 1L..doubleTapWindowMs
 
                     var previousCentroid: Offset? = null
                     var threeFingerStartCentroid: Offset? = null
@@ -946,28 +941,30 @@ private fun DeXTouchpadSurface(
                             val pendingHoldThresholdMs: Long? = when {
                                 isTapDragActive || dragStartFailed || gestureController.isDragActive -> null
                                 maxPointerCount != 1 -> null
-                                isQuickSecondTouch -> doubleTapHoldDragMs
-                                !isMovingCursor && totalSingleFingerDistance <= tapSlopPx -> longPressDragMs
+                                !isMovingCursor && maxSingleFingerDisplacement <= tapSlopPx -> tapHoldDelayMs
                                 else -> null
                             }
 
                             val event = if (pendingHoldThresholdMs != null) {
                                 val elapsed = (SystemClock.uptimeMillis() - downTime).coerceAtLeast(0L)
-                                val remaining = (pendingHoldThresholdMs - elapsed).coerceAtLeast(1L)
-                                withTimeoutOrNull(remaining) {
-                                    awaitPointerEvent(PointerEventPass.Main)
+                                val remaining = pendingHoldThresholdMs - elapsed
+                                if (remaining <= 0L) {
+                                    null
+                                } else {
+                                    withTimeoutOrNull(remaining) {
+                                        awaitPointerEvent(PointerEventPass.Main)
+                                    }
                                 }
                             } else {
                                 awaitPointerEvent(PointerEventPass.Main)
                             }
 
                             if (event == null) {
-                                // Finger remained stationary past the hold-drag threshold; start drag
-                                // immediately and keep it active until all fingers lift.
+                                // Finger remained stationary past the tap-and-hold threshold; start
+                                // drag immediately and keep it active until all fingers lift.
                                 if (!gestureController.isDragActive) {
                                     if (gestureController.onDragStart(GestureController.DragOwner.TOUCHPAD)) {
                                         isTapDragActive = true
-                                        lastSingleTapUpTime = 0L
                                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                     } else {
                                         dragStartFailed = true
@@ -1015,32 +1012,32 @@ private fun DeXTouchpadSurface(
                                 val change = activeChanges.first()
                                 val delta = change.position - change.previousPosition
                                 val stepDist = hypot(delta.x, delta.y)
-                                totalSingleFingerDistance += stepDist
+                                val displacementFromDown = hypot(
+                                    change.position.x - downPos.x,
+                                    change.position.y - downPos.y
+                                )
+                                if (displacementFromDown > maxSingleFingerDisplacement) {
+                                    maxSingleFingerDisplacement = displacementFromDown
+                                }
 
                                 val heldDuration = eventTime - downTime
 
-                                if (!gestureController.isDragActive && !dragStartFailed) {
-                                    val triggerDoubleTapDrag =
-                                        isQuickSecondTouch &&
-                                            (totalSingleFingerDistance > tapSlopPx || heldDuration >= doubleTapHoldDragMs)
-                                    val triggerLongPressDrag =
-                                        !isMovingCursor &&
-                                            heldDuration >= longPressDragMs &&
-                                            totalSingleFingerDistance <= tapSlopPx
-
-                                    if (triggerDoubleTapDrag || triggerLongPressDrag) {
-                                        if (gestureController.onDragStart(GestureController.DragOwner.TOUCHPAD)) {
-                                            isTapDragActive = true
-                                            dragPointerId = change.id
-                                            lastSingleTapUpTime = 0L
-                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        } else {
-                                            dragStartFailed = true
-                                        }
+                                if (!gestureController.isDragActive &&
+                                    !dragStartFailed &&
+                                    !isMovingCursor &&
+                                    maxSingleFingerDisplacement <= tapSlopPx &&
+                                    heldDuration >= tapHoldDelayMs
+                                ) {
+                                    if (gestureController.onDragStart(GestureController.DragOwner.TOUCHPAD)) {
+                                        isTapDragActive = true
+                                        dragPointerId = change.id
+                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    } else {
+                                        dragStartFailed = true
                                     }
                                 }
 
-                                if (totalSingleFingerDistance > tapSlopPx * 0.45f ||
+                                if (maxSingleFingerDisplacement > tapSlopPx ||
                                     isMovingCursor ||
                                     isTapDragActive ||
                                     gestureController.isDragActive
@@ -1085,7 +1082,6 @@ private fun DeXTouchpadSurface(
                                             abs(totalDelta.y) > abs(totalDelta.x) * 1.2f
                                         ) {
                                             threeFingerSwipeTriggered = true
-                                            lastSingleTapUpTime = 0L
                                             val handled = if (totalDelta.y > 0f) {
                                                 gestureController.onThreeFingerSwipeDown()
                                             } else {
@@ -1108,39 +1104,34 @@ private fun DeXTouchpadSurface(
                         }
                     }
 
-                    val gestureDuration = lastEventTime - downTime
+                    val gestureDuration = (lastEventTime - downTime).coerceAtLeast(0L)
 
                     if (!isTapDragActive && !threeFingerSwipeTriggered && !gestureController.isDragActive) {
-                        when {
-                            maxPointerCount == 1 &&
-                                totalSingleFingerDistance <= tapSlopPx &&
-                                gestureDuration <= tapTimeoutMs -> {
+                        when (maxPointerCount) {
+                            1 -> if (!isMovingCursor &&
+                                !dragStartFailed &&
+                                maxSingleFingerDisplacement <= tapSlopPx &&
+                                gestureDuration < tapHoldDelayMs
+                            ) {
                                 if (gestureController.onTap()) {
                                     view.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
                                 }
-                                lastSingleTapUpTime = if (isQuickSecondTouch) 0L else lastEventTime
                             }
 
-                            maxPointerCount == 2 &&
-                                totalTwoFingerDistance <= tapSlopPx * 1.5f &&
-                                gestureDuration <= tapTimeoutMs + 50L -> {
+                            2 -> if (totalTwoFingerDistance <= tapSlopPx * 1.5f &&
+                                gestureDuration <= multiFingerTapTimeoutMs + 50L
+                            ) {
                                 if (gestureController.onSecondaryTap()) {
                                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                 }
-                                lastSingleTapUpTime = 0L
                             }
 
-                            maxPointerCount == 3 &&
-                                totalThreeFingerDistance <= tapSlopPx * 2.0f &&
-                                gestureDuration <= tapTimeoutMs + 80L -> {
+                            3 -> if (totalThreeFingerDistance <= tapSlopPx * 2.0f &&
+                                gestureDuration <= multiFingerTapTimeoutMs + 80L
+                            ) {
                                 if (gestureController.onThreeFingerTap()) {
                                     view.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
                                 }
-                                lastSingleTapUpTime = 0L
-                            }
-
-                            else -> {
-                                lastSingleTapUpTime = 0L
                             }
                         }
                     }

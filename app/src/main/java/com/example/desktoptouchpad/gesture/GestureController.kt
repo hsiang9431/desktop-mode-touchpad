@@ -16,10 +16,10 @@ class GestureController {
             prefs?.edit { putFloat(KEY_SENSITIVITY, value) }
         }
 
-    var doubleTapIntervalMs: Long = DEFAULT_DOUBLE_TAP_INTERVAL_MS
+    var tapHoldDelayMs: Long = DEFAULT_TAP_HOLD_DELAY_MS
         set(value) {
-            field = value.coerceIn(MIN_DOUBLE_TAP_INTERVAL_MS, MAX_DOUBLE_TAP_INTERVAL_MS)
-            prefs?.edit { putLong(KEY_DOUBLE_TAP_INTERVAL_MS, field) }
+            field = value.coerceIn(MIN_TAP_HOLD_DELAY_MS, MAX_TAP_HOLD_DELAY_MS)
+            prefs?.edit { putLong(KEY_TAP_HOLD_DELAY_MS, field) }
         }
 
     var naturalScrolling: Boolean = DEFAULT_NATURAL_SCROLLING
@@ -38,8 +38,8 @@ class GestureController {
         val sp = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs = sp
         sensitivity = sp.getFloat(KEY_SENSITIVITY, DEFAULT_SENSITIVITY)
-        doubleTapIntervalMs = sp.getLong(KEY_DOUBLE_TAP_INTERVAL_MS, DEFAULT_DOUBLE_TAP_INTERVAL_MS)
-            .coerceIn(MIN_DOUBLE_TAP_INTERVAL_MS, MAX_DOUBLE_TAP_INTERVAL_MS)
+        tapHoldDelayMs = sp.getLong(KEY_TAP_HOLD_DELAY_MS, DEFAULT_TAP_HOLD_DELAY_MS)
+            .coerceIn(MIN_TAP_HOLD_DELAY_MS, MAX_TAP_HOLD_DELAY_MS)
         naturalScrolling = sp.getBoolean(KEY_NATURAL_SCROLLING, DEFAULT_NATURAL_SCROLLING)
         threeFingerGesturesEnabled =
             sp.getBoolean(KEY_THREE_FINGER_GESTURES, DEFAULT_THREE_FINGER_GESTURES)
@@ -138,14 +138,14 @@ class GestureController {
     companion object {
         private const val PREFS_NAME = "touchpad_prefs"
         private const val KEY_SENSITIVITY = "sensitivity"
-        private const val KEY_DOUBLE_TAP_INTERVAL_MS = "double_tap_interval_ms"
+        private const val KEY_TAP_HOLD_DELAY_MS = "tap_hold_delay_ms"
         private const val KEY_NATURAL_SCROLLING = "natural_scrolling"
         private const val KEY_THREE_FINGER_GESTURES = "three_finger_gestures"
 
         const val DEFAULT_SENSITIVITY = 1.6f
-        const val DEFAULT_DOUBLE_TAP_INTERVAL_MS = 300L
-        const val MIN_DOUBLE_TAP_INTERVAL_MS = 150L
-        const val MAX_DOUBLE_TAP_INTERVAL_MS = 550L
+        const val DEFAULT_TAP_HOLD_DELAY_MS = 350L
+        const val MIN_TAP_HOLD_DELAY_MS = 200L
+        const val MAX_TAP_HOLD_DELAY_MS = 600L
         const val DEFAULT_NATURAL_SCROLLING = true
         const val DEFAULT_THREE_FINGER_GESTURES = true
     }
