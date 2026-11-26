@@ -102,6 +102,10 @@ class TouchpadAccessibilityService : AccessibilityService() {
 
     private fun configureAccessibilityFlags() {
         val info = serviceInfo ?: return
+        info.eventTypes = info.eventTypes or
+            AccessibilityEvent.TYPE_VIEW_FOCUSED or
+            AccessibilityEvent.TYPE_VIEW_CLICKED or
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
         var desiredFlags = info.flags or
             AccessibilityServiceInfo.DEFAULT or
             AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
@@ -113,7 +117,11 @@ class TouchpadAccessibilityService : AccessibilityService() {
         serviceInfo = info
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null) return
+        val displayId = activeTargetDisplayId() ?: return
+        externalTextBridge.onAccessibilityEventQuiet(event, displayId)
+    }
 
     override fun onInterrupt() {
         resetDragState()

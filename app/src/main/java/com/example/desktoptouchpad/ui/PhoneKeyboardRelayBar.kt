@@ -386,9 +386,17 @@ fun PhoneKeyboardRelayBar(
                     oledSaver = oledSaverMode,
                     onClick = {
                         val view = editTextRef ?: return@RelayActionMiniButton
-                        if (!view.text.isNullOrEmpty()) {
-                            view.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DEL))
-                            view.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_DEL))
+                        val editable = view.text
+                        if (!editable.isNullOrEmpty()) {
+                            val selStart = view.selectionStart.coerceAtLeast(0)
+                            val selEnd = view.selectionEnd.coerceAtLeast(0)
+                            if (selStart != selEnd) {
+                                editable.delete(minOf(selStart, selEnd), maxOf(selStart, selEnd))
+                            } else if (selStart > 0) {
+                                editable.delete(selStart - 1, selStart)
+                            } else {
+                                editable.delete(editable.length - 1, editable.length)
+                            }
                         } else {
                             TouchpadAccessibilityService.instance?.sendBackspaceToSelectedBox()
                         }
