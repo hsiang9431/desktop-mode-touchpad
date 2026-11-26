@@ -34,6 +34,12 @@ class GestureController {
             prefs?.edit { putBoolean(KEY_THREE_FINGER_GESTURES, value) }
         }
 
+    var touchpadLandscape: Boolean = DEFAULT_TOUCHPAD_LANDSCAPE
+        set(value) {
+            field = value
+            prefs?.edit { putBoolean(KEY_TOUCHPAD_LANDSCAPE, value) }
+        }
+
     fun attachContext(context: Context) {
         val sp = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs = sp
@@ -43,6 +49,7 @@ class GestureController {
         naturalScrolling = sp.getBoolean(KEY_NATURAL_SCROLLING, DEFAULT_NATURAL_SCROLLING)
         threeFingerGesturesEnabled =
             sp.getBoolean(KEY_THREE_FINGER_GESTURES, DEFAULT_THREE_FINGER_GESTURES)
+        touchpadLandscape = sp.getBoolean(KEY_TOUCHPAD_LANDSCAPE, DEFAULT_TOUCHPAD_LANDSCAPE)
     }
 
     fun onMove(dx: Float, dy: Float, dtMillis: Long = 16L) {
@@ -141,6 +148,7 @@ class GestureController {
         private const val KEY_TAP_HOLD_DELAY_MS = "tap_hold_delay_ms"
         private const val KEY_NATURAL_SCROLLING = "natural_scrolling"
         private const val KEY_THREE_FINGER_GESTURES = "three_finger_gestures"
+        private const val KEY_TOUCHPAD_LANDSCAPE = "touchpad_landscape"
 
         const val DEFAULT_SENSITIVITY = 1.6f
         const val DEFAULT_TAP_HOLD_DELAY_MS = 350L
@@ -148,5 +156,6 @@ class GestureController {
         const val MAX_TAP_HOLD_DELAY_MS = 600L
         const val DEFAULT_NATURAL_SCROLLING = true
         const val DEFAULT_THREE_FINGER_GESTURES = true
+        const val DEFAULT_TOUCHPAD_LANDSCAPE = false
     }
 }

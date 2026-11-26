@@ -21,6 +21,7 @@
     <string name="btn_home">Home</string>
     <string name="btn_center_cursor">Center</string>
     <string name="btn_settings">Options</string>
+    <string name="btn_rotate_touchpad">Rotate Touchpad 90\u00B0</string>
     <string name="label_sensitivity">Pointer Speed</string>
     <string name="label_tap_hold_delay">Tap &amp; Hold Delay</string>
     <string name="label_natural_scroll">Natural Two-Finger Scroll</string>

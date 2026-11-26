@@ -6,6 +6,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ActivityInfo
 import android.hardware.display.DisplayManager
 import android.os.Bundle
 import android.os.Handler
@@ -38,11 +39,13 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Slider
@@ -61,6 +64,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -70,11 +74,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.desktoptouchpad.gesture.GestureController
@@ -322,6 +329,15 @@ class MainActivity : ComponentActivity() {
                     onOpenSettings = {
                         startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                     },
+                    onSetPortraitOrientationLock = { locked ->
+                        runCatching {
+                            requestedOrientation = if (locked) {
+                                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                            } else {
+                                ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                            }
+                        }
+                    },
                 )
             }
         }
@@ -485,7 +501,8 @@ fun TouchpadScreen(
     onExternalDisplayConnected: () -> Unit,
     onSetKeepScreenOn: (Boolean) -> Unit,
     onSetAllowNonFocusableOnInput: (Boolean) -> Unit,
-    onOpenSettings: () -> Unit
+    onOpenSettings: () -> Unit,
+    onSetPortraitOrientationLock: (Boolean) -> Unit = {}
 ) {
     val isServiceActive by TouchpadAccessibilityService.isConnected.collectAsState()
     val externalDisplay by TouchpadAccessibilityService.externalDisplay.collectAsState()
@@ -505,6 +522,9 @@ fun TouchpadScreen(
     var naturalScrolling by remember { mutableStateOf(gestureController.naturalScrolling) }
     var threeFingerGesturesEnabled by remember {
         mutableStateOf(gestureController.threeFingerGesturesEnabled)
+    }
+    var touchpadLandscape by remember {
+        mutableStateOf(gestureController.touchpadLandscape)
     }
 
     val isDesktopReady = isServiceActive && externalDisplay != null
@@ -530,6 +550,15 @@ fun TouchpadScreen(
         onDispose { onSetKeepScreenOn(false) }
     }
 
+    DisposableEffect(touchpadLandscape) {
+        onSetPortraitOrientationLock(touchpadLandscape)
+        onDispose {
+            if (touchpadLandscape) {
+                onSetPortraitOrientationLock(false)
+            }
+        }
+    }
+
     Surface(
         modifier = Modifier.fillMaxSize(),
         color = Color.Black
@@ -551,9 +580,15 @@ fun TouchpadScreen(
                         isServiceActive = isServiceActive,
                         externalDisplay = externalDisplay,
                         showOptions = showOptions,
+                        touchpadLandscape = touchpadLandscape,
                         onEnableServiceClick = { showDisclosure = true },
                         onCenterCursor = { gestureController.onCenterCursor() },
-                        onToggleOptions = { showOptions = !showOptions }
+                        onToggleOptions = { showOptions = !showOptions },
+                        onToggleTouchpadLandscape = {
+                            val next = !touchpadLandscape
+                            touchpadLandscape = next
+                            gestureController.touchpadLandscape = next
+                        }
                     )
 
                     if (showOptions && !isKeyboardRelayVisible) {
@@ -593,6 +628,7 @@ fun TouchpadScreen(
                     isDesktopReady = isDesktopReady,
                     isDragging = isDragging,
                     threeFingerGesturesEnabled = threeFingerGesturesEnabled,
+                    isTouchpadLandscape = touchpadLandscape,
                     compactHint = isKeyboardRelayVisible
                 )
 
@@ -642,9 +678,11 @@ private fun StatusHeaderCard(
     isServiceActive: Boolean,
     externalDisplay: ExternalDisplayInfo?,
     showOptions: Boolean,
+    touchpadLandscape: Boolean,
     onEnableServiceClick: () -> Unit,
     onCenterCursor: () -> Unit,
-    onToggleOptions: () -> Unit
+    onToggleOptions: () -> Unit,
+    onToggleTouchpadLandscape: () -> Unit
 ) {
     val isDesktopReady = isServiceActive && externalDisplay != null
 
@@ -685,12 +723,6 @@ private fun StatusHeaderCard(
                     }
 
                     Text(
-                        text = stringResource(R.string.app_name),
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFF7F849C)
-                    )
-                    Text(
                         text = statusText,
                         fontSize = 12.sp,
                         color = statusColor,
@@ -710,6 +742,12 @@ private fun StatusHeaderCard(
                         active = showOptions,
                         enabled = true,
                         onClick = onToggleOptions
+                    )
+                    SmallIconControlChip(
+                        iconRes = R.drawable.ic_rotate_touchpad,
+                        contentDescription = stringResource(R.string.btn_rotate_touchpad),
+                        active = touchpadLandscape,
+                        onClick = onToggleTouchpadLandscape
                     )
                 }
             }
@@ -765,6 +803,34 @@ private fun SmallControlChip(
                 enabled -> Color(0xFF7F849C)
                 else -> Color(0xFF45475A)
             }
+        )
+    }
+}
+
+@Composable
+private fun SmallIconControlChip(
+    iconRes: Int,
+    contentDescription: String,
+    active: Boolean,
+    onClick: () -> Unit
+) {
+    OutlinedButton(
+        onClick = onClick,
+        contentPadding = PaddingValues(0.dp),
+        modifier = Modifier.size(32.dp),
+        border = BorderStroke(
+            1.dp,
+            if (active) Color(0xFF89B4FA) else Color(0xFF313244)
+        ),
+        colors = ButtonDefaults.outlinedButtonColors(
+            containerColor = if (active) Color(0x2689B4FA) else Color.Transparent
+        )
+    ) {
+        Icon(
+            painter = painterResource(iconRes),
+            contentDescription = contentDescription,
+            modifier = Modifier.size(16.dp),
+            tint = if (active) Color(0xFF89B4FA) else Color(0xFF7F849C)
         )
     }
 }
@@ -886,6 +952,32 @@ private fun TouchpadOptionsPanel(
     }
 }
 
+private fun rotateTouchpadDelta(delta: Offset, isTouchpadLandscape: Boolean): Offset {
+    return if (isTouchpadLandscape) {
+        Offset(x = delta.y, y = -delta.x)
+    } else {
+        delta
+    }
+}
+
+private fun Modifier.rotateLayout90Clockwise(): Modifier = layout { measurable, constraints ->
+    val swappedConstraints = Constraints(
+        minWidth = constraints.minHeight,
+        maxWidth = constraints.maxHeight,
+        minHeight = constraints.minWidth,
+        maxHeight = constraints.maxWidth
+    )
+    val placeable = measurable.measure(swappedConstraints)
+    layout(placeable.height, placeable.width) {
+        placeable.placeWithLayer(
+            x = (placeable.height - placeable.width) / 2,
+            y = (placeable.width - placeable.height) / 2
+        ) {
+            rotationZ = 90f
+        }
+    }
+}
+
 @Composable
 private fun DeXTouchpadSurface(
     modifier: Modifier,
@@ -893,10 +985,12 @@ private fun DeXTouchpadSurface(
     isDesktopReady: Boolean,
     isDragging: Boolean,
     threeFingerGesturesEnabled: Boolean,
+    isTouchpadLandscape: Boolean,
     compactHint: Boolean
 ) {
     val haptic = LocalHapticFeedback.current
     val view = LocalView.current
+    val currentTouchpadLandscape by rememberUpdatedState(isTouchpadLandscape)
 
     val borderColor = when {
         isDragging -> Color(0xFF89B4FA)
@@ -992,7 +1086,10 @@ private fun DeXTouchpadSurface(
                                 val tracked = activeChanges.firstOrNull { it.id == dragPointerId }
                                     ?: activeChanges.first().also { dragPointerId = it.id }
                                 if (tracked.previousPressed) {
-                                    val delta = tracked.position - tracked.previousPosition
+                                    val delta = rotateTouchpadDelta(
+                                        tracked.position - tracked.previousPosition,
+                                        currentTouchpadLandscape
+                                    )
                                     val stepDist = hypot(delta.x, delta.y)
                                     if (stepDist > 0f) {
                                         gestureController.onMove(delta.x, delta.y, dtMs)
@@ -1010,7 +1107,10 @@ private fun DeXTouchpadSurface(
 
                             if (pointerCount == 1 && maxPointerCount == 1) {
                                 val change = activeChanges.first()
-                                val delta = change.position - change.previousPosition
+                                val delta = rotateTouchpadDelta(
+                                        change.position - change.previousPosition,
+                                        currentTouchpadLandscape
+                                    )
                                 val stepDist = hypot(delta.x, delta.y)
                                 val displacementFromDown = hypot(
                                     change.position.x - downPos.x,
@@ -1061,7 +1161,10 @@ private fun DeXTouchpadSurface(
 
                                 val prev = previousCentroid
                                 if (pointerCount == 2 && maxPointerCount == 2 && prev != null) {
-                                    val scrollDelta = currentCentroid - prev
+                                    val scrollDelta = rotateTouchpadDelta(
+                                        currentCentroid - prev,
+                                        currentTouchpadLandscape
+                                    )
                                     val stepScroll = hypot(scrollDelta.x, scrollDelta.y)
                                     totalTwoFingerDistance += stepScroll
                                     if (totalTwoFingerDistance > scrollSlopPx && stepScroll > 0f) {
@@ -1076,7 +1179,10 @@ private fun DeXTouchpadSurface(
                                             val step3 = currentCentroid - prev
                                             totalThreeFingerDistance += hypot(step3.x, step3.y)
                                         }
-                                        val totalDelta = currentCentroid - start3
+                                        val totalDelta = rotateTouchpadDelta(
+                                            currentCentroid - start3,
+                                            currentTouchpadLandscape
+                                        )
                                         if (!threeFingerSwipeTriggered &&
                                             abs(totalDelta.y) >= threeFingerSwipeThresholdPx &&
                                             abs(totalDelta.y) > abs(totalDelta.x) * 1.2f
@@ -1141,7 +1247,13 @@ private fun DeXTouchpadSurface(
     ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.padding(horizontal = 24.dp)
+            modifier = if (isTouchpadLandscape) {
+                Modifier
+                    .rotateLayout90Clockwise()
+                    .padding(horizontal = 24.dp, vertical = 16.dp)
+            } else {
+                Modifier.padding(horizontal = 24.dp)
+            }
         ) {
             Text(
                 text = stringResource(R.string.touchpad_title),
