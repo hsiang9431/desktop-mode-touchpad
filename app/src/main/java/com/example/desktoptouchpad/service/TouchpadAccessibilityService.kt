@@ -65,6 +65,8 @@ class TouchpadAccessibilityService : AccessibilityService() {
     private var lastDragX = 0f
     private var lastDragY = 0f
     private var dragDisplayId = Display.INVALID_DISPLAY
+    private var dragGeneration = 0
+    private var dragRestartCount = 0
 
     private var isScrollInFlight = false
     private var pendingScrollX = 0f
@@ -141,7 +143,9 @@ class TouchpadAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
 
     override fun onInterrupt() {
-        resetDragState()
+        // Intentional no-op: AccessibilityManager.interrupt() is triggered routinely by apps and
+        // system UI (e.g. when starting drag-and-drop or changing focus) to silence spoken
+        // feedback. Resetting drag state here would drop active drags while the finger is still down.
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
@@ -314,9 +318,11 @@ class TouchpadAccessibilityService : AccessibilityService() {
         return dispatched
     }
 
+    fun isDragActive(): Boolean = isDragRequested || (activeDragStroke != null)
+
     fun startDrag(): Boolean {
         val displayId = activeTargetDisplayId() ?: return false
-        if (isDragRequested || (activeDragStroke != null)) return true
+        if (isDragRequested) return true
 
         if (_textSession.value == null) {
             suppressExternalSoftKeyboard()
@@ -324,15 +330,27 @@ class TouchpadAccessibilityService : AccessibilityService() {
         pendingScrollX = 0f
         pendingScrollY = 0f
 
+        isDragRequested = true
+        overlayManager.setDraggingVisual(isDragging = true)
+        _isDragging.value = true
+
+        if ((activeDragStroke != null) && (dragDisplayId == displayId)) {
+            // Re-armed before the release slice was dispatched; keep holding the existing stroke.
+            return true
+        }
+
+        dragRestartCount = 0
+        return beginDragStroke(displayId)
+    }
+
+    private fun beginDragStroke(displayId: Int): Boolean {
         val (rawX, rawY) = overlayManager.getCursorCoordinates()
         val (startX, startY) = clampToDisplay(rawX, rawY)
 
-        isDragRequested = true
+        dragGeneration++
         dragDisplayId = displayId
         lastDragX = startX
         lastDragY = startY
-        overlayManager.setDraggingVisual(isDragging = true)
-        _isDragging.value = true
 
         val initialPath = Path().apply {
             moveTo(startX, startY)
@@ -345,11 +363,16 @@ class TouchpadAccessibilityService : AccessibilityService() {
             /* willContinue = */ true,
         )
         activeDragStroke = initialStroke
-        dispatchDragSlice(displayId, initialStroke, isFinalRelease = false)
-        return true
+        return dispatchDragSlice(
+            displayId = displayId,
+            stroke = initialStroke,
+            isFinalRelease = false,
+            generation = dragGeneration,
+        )
     }
 
     fun endDrag() {
+        if (!isDragRequested) return
         isDragRequested = false
         scheduleHoverInspection(delayMs = 120L)
     }
@@ -358,16 +381,19 @@ class TouchpadAccessibilityService : AccessibilityService() {
         displayId: Int,
         stroke: GestureDescription.StrokeDescription,
         isFinalRelease: Boolean,
-    ) {
+        generation: Int,
+    ): Boolean {
         val dispatched = dispatchGesture(
             createGestureBuilder(displayId).addStroke(stroke).build(),
             object : GestureResultCallback() {
                 override fun onCompleted(gestureDescription: GestureDescription?) {
+                    if (generation != dragGeneration) return
                     if (isFinalRelease || (activeDragStroke == null) || (activeTargetDisplayId() != displayId)) {
                         resetDragState()
                         return
                     }
 
+                    dragRestartCount = 0
                     val (rawX, rawY) = overlayManager.getCursorCoordinates()
                     val (targetX, targetY) = clampToDisplay(rawX, rawY)
                     val segmentPath = Path().apply {
@@ -391,10 +417,25 @@ class TouchpadAccessibilityService : AccessibilityService() {
                     }
 
                     activeDragStroke = if (keepHolding) nextStroke else null
-                    dispatchDragSlice(displayId, nextStroke, isFinalRelease = !keepHolding)
+                    dispatchDragSlice(
+                        displayId = displayId,
+                        stroke = nextStroke,
+                        isFinalRelease = !keepHolding,
+                        generation = generation,
+                    )
                 }
 
                 override fun onCancelled(gestureDescription: GestureDescription?) {
+                    if (generation != dragGeneration) return
+                    if (!isFinalRelease &&
+                        isDragRequested &&
+                        (activeTargetDisplayId() == displayId) &&
+                        (dragRestartCount < MAX_DRAG_RESTARTS)
+                    ) {
+                        dragRestartCount++
+                        beginDragStroke(displayId)
+                        return
+                    }
                     resetDragState()
                 }
             },
@@ -402,11 +443,17 @@ class TouchpadAccessibilityService : AccessibilityService() {
         )
 
         if (!dispatched) {
-            resetDragState()
+            if (generation == dragGeneration) {
+                resetDragState()
+            }
+            return false
         }
+        return true
     }
 
     private fun resetDragState() {
+        dragGeneration++
+        dragRestartCount = 0
         isDragRequested = false
         activeDragStroke = null
         dragDisplayId = Display.INVALID_DISPLAY
@@ -752,6 +799,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
 
     private fun dispatchEdgeBackGestureOnDisplay(displayId: Int): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
+        if (isDragActive()) return false
         val (width, height) = overlayManager.getDisplayDimensions()
         val startX = 2f
         val endX = (width * 0.22f).coerceIn(90f, 240f).coerceAtMost((width - 2).toFloat())
@@ -766,6 +814,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
 
     private fun dispatchBottomHomeSwipeOnDisplay(displayId: Int): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
+        if (isDragActive()) return false
         val (width, height) = overlayManager.getDisplayDimensions()
         val centerX = (width * 0.5f).coerceAtLeast(2f)
         val startY = (height - 2).coerceAtLeast(10).toFloat()
@@ -780,6 +829,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
 
     private fun dispatchOverviewSwipeHoldOnDisplay(displayId: Int): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
+        if (isDragActive()) return false
         val (width, height) = overlayManager.getDisplayDimensions()
         val centerX = (width * 0.5f).coerceAtLeast(2f)
         val startY = (height - 2).coerceAtLeast(20).toFloat()
@@ -1049,6 +1099,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
         private const val LONG_PRESS_DURATION_MS = 520L
         private const val DRAG_SLICE_DURATION_MS = 55L
         private const val DRAG_RELEASE_DURATION_MS = 25L
+        private const val MAX_DRAG_RESTARTS = 3
         private const val SCROLL_DURATION_MS = 65L
         private const val MIN_SCROLL_DISPATCH_PX = 4f
         private const val SINGLE_SCROLL_STROKE_PX = 260f

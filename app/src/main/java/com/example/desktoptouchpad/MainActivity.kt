@@ -2,6 +2,7 @@ package com.example.desktoptouchpad
 
 import android.content.Intent
 import android.os.Bundle
+import android.os.SystemClock
 import android.provider.Settings
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -567,6 +568,7 @@ private fun DeXTouchpadSurface(
                 val scrollSlopPx = 4.dp.toPx()
                 val threeFingerSwipeThresholdPx = 44.dp.toPx()
                 val tapTimeoutMs = 230L
+                val doubleTapHoldDragMs = 170L
                 val longPressDragMs = 420L
 
                 var lastSingleTapUpTime = 0L
@@ -583,6 +585,8 @@ private fun DeXTouchpadSurface(
                     var totalThreeFingerDistance = 0f
                     var isMovingCursor = false
                     var isTapDragActive = false
+                    var dragStartFailed = false
+                    var dragPointerId = firstDown.id
                     var threeFingerSwipeTriggered = false
 
                     val doubleTapWindowMs = gestureController.doubleTapIntervalMs
@@ -591,116 +595,176 @@ private fun DeXTouchpadSurface(
                     var previousCentroid: Offset? = null
                     var threeFingerStartCentroid: Offset? = null
 
-                    while (true) {
-                        val event = awaitPointerEvent(PointerEventPass.Main)
-                        val activeChanges = event.changes.filter { it.pressed }
+                    try {
+                        while (true) {
+                            val pendingHoldThresholdMs: Long? = when {
+                                isTapDragActive || dragStartFailed || gestureController.isDragActive -> null
+                                maxPointerCount != 1 -> null
+                                isQuickSecondTouch -> doubleTapHoldDragMs
+                                !isMovingCursor && totalSingleFingerDistance <= tapSlopPx -> longPressDragMs
+                                else -> null
+                            }
 
-                        if (activeChanges.isEmpty()) {
-                            break
-                        }
+                            val event = if (pendingHoldThresholdMs != null) {
+                                val elapsed = (SystemClock.uptimeMillis() - downTime).coerceAtLeast(0L)
+                                val remaining = (pendingHoldThresholdMs - elapsed).coerceAtLeast(1L)
+                                withTimeoutOrNull(remaining) {
+                                    awaitPointerEvent(PointerEventPass.Main)
+                                }
+                            } else {
+                                awaitPointerEvent(PointerEventPass.Main)
+                            }
 
-                        val pointerCount = activeChanges.size
-                        if (pointerCount > maxPointerCount) {
-                            maxPointerCount = pointerCount
-                            previousCentroid = null
-                        }
-
-                        val eventTime = activeChanges.maxOf { it.uptimeMillis }
-                        val dtMs = (eventTime - lastEventTime).coerceAtLeast(4L)
-                        lastEventTime = eventTime
-
-                        if (pointerCount == 1 && maxPointerCount == 1) {
-                            val change = activeChanges.first()
-                            val delta = change.position - change.previousPosition
-                            val stepDist = hypot(delta.x, delta.y)
-                            totalSingleFingerDistance += stepDist
-
-                            val heldDuration = eventTime - downTime
-
-                            if (!isTapDragActive) {
-                                val triggerDoubleTapDrag =
-                                    isQuickSecondTouch && (totalSingleFingerDistance > tapSlopPx || heldDuration > 170L)
-                                val triggerLongPressDrag =
-                                    !isMovingCursor && heldDuration >= longPressDragMs && totalSingleFingerDistance <= tapSlopPx
-
-                                if (triggerDoubleTapDrag || triggerLongPressDrag) {
-                                    if (gestureController.onDragStart()) {
+                            if (event == null) {
+                                // Finger remained stationary past the hold-drag threshold; start drag
+                                // immediately and keep it active until all fingers lift.
+                                if (!gestureController.isDragActive) {
+                                    if (gestureController.onDragStart(GestureController.DragOwner.TOUCHPAD)) {
                                         isTapDragActive = true
                                         lastSingleTapUpTime = 0L
                                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    } else {
+                                        dragStartFailed = true
                                     }
-                                }
-                            }
-
-                            if (totalSingleFingerDistance > tapSlopPx * 0.45f || isMovingCursor || isTapDragActive) {
-                                isMovingCursor = true
-                                if (stepDist > 0f) {
-                                    gestureController.onMove(delta.x, delta.y, dtMs)
-                                }
-                            }
-                        } else if (pointerCount >= 2) {
-                            if (isTapDragActive) {
-                                gestureController.onDragEnd()
-                                isTapDragActive = false
-                            }
-
-                            var sumX = 0f
-                            var sumY = 0f
-                            for (change in activeChanges) {
-                                sumX += change.position.x
-                                sumY += change.position.y
-                            }
-                            val currentCentroid = Offset(
-                                x = sumX / pointerCount,
-                                y = sumY / pointerCount
-                            )
-
-                            val prev = previousCentroid
-                            if (pointerCount == 2 && maxPointerCount == 2 && prev != null) {
-                                val scrollDelta = currentCentroid - prev
-                                val stepScroll = hypot(scrollDelta.x, scrollDelta.y)
-                                totalTwoFingerDistance += stepScroll
-                                if (totalTwoFingerDistance > scrollSlopPx && stepScroll > 0f) {
-                                    gestureController.onTwoFingerScroll(scrollDelta.x, scrollDelta.y)
-                                }
-                            } else if (pointerCount == 3 && maxPointerCount == 3) {
-                                val start3 = threeFingerStartCentroid
-                                if (start3 == null) {
-                                    threeFingerStartCentroid = currentCentroid
                                 } else {
-                                    if (prev != null) {
-                                        val step3 = currentCentroid - prev
-                                        totalThreeFingerDistance += hypot(step3.x, step3.y)
+                                    dragStartFailed = true
+                                }
+                                continue
+                            }
+
+                            val activeChanges = event.changes.filter { it.pressed }
+
+                            if (activeChanges.isEmpty()) {
+                                lastEventTime = event.changes.maxOfOrNull { it.uptimeMillis } ?: lastEventTime
+                                event.changes.forEach { it.consume() }
+                                break
+                            }
+
+                            val eventTime = activeChanges.maxOf { it.uptimeMillis }
+                            val dtMs = (eventTime - lastEventTime).coerceAtLeast(4L)
+                            lastEventTime = eventTime
+
+                            if (isTapDragActive) {
+                                // Once dragging, never end until every finger lifts from the touchpad.
+                                val tracked = activeChanges.firstOrNull { it.id == dragPointerId }
+                                    ?: activeChanges.first().also { dragPointerId = it.id }
+                                if (tracked.previousPressed) {
+                                    val delta = tracked.position - tracked.previousPosition
+                                    val stepDist = hypot(delta.x, delta.y)
+                                    if (stepDist > 0f) {
+                                        gestureController.onMove(delta.x, delta.y, dtMs)
                                     }
-                                    val totalDelta = currentCentroid - start3
-                                    if (!threeFingerSwipeTriggered &&
-                                        abs(totalDelta.y) >= threeFingerSwipeThresholdPx &&
-                                        abs(totalDelta.y) > abs(totalDelta.x) * 1.2f
-                                    ) {
-                                        threeFingerSwipeTriggered = true
-                                        lastSingleTapUpTime = 0L
-                                        val handled = if (totalDelta.y > 0f) {
-                                            gestureController.onThreeFingerSwipeDown()
-                                        } else {
-                                            gestureController.onThreeFingerSwipeUp()
-                                        }
-                                        if (handled) {
+                                }
+                                event.changes.forEach { it.consume() }
+                                continue
+                            }
+
+                            val pointerCount = activeChanges.size
+                            if (pointerCount > maxPointerCount) {
+                                maxPointerCount = pointerCount
+                                previousCentroid = null
+                            }
+
+                            if (pointerCount == 1 && maxPointerCount == 1) {
+                                val change = activeChanges.first()
+                                val delta = change.position - change.previousPosition
+                                val stepDist = hypot(delta.x, delta.y)
+                                totalSingleFingerDistance += stepDist
+
+                                val heldDuration = eventTime - downTime
+
+                                if (!gestureController.isDragActive && !dragStartFailed) {
+                                    val triggerDoubleTapDrag =
+                                        isQuickSecondTouch &&
+                                            (totalSingleFingerDistance > tapSlopPx || heldDuration >= doubleTapHoldDragMs)
+                                    val triggerLongPressDrag =
+                                        !isMovingCursor &&
+                                            heldDuration >= longPressDragMs &&
+                                            totalSingleFingerDistance <= tapSlopPx
+
+                                    if (triggerDoubleTapDrag || triggerLongPressDrag) {
+                                        if (gestureController.onDragStart(GestureController.DragOwner.TOUCHPAD)) {
+                                            isTapDragActive = true
+                                            dragPointerId = change.id
+                                            lastSingleTapUpTime = 0L
                                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        } else {
+                                            dragStartFailed = true
                                         }
                                     }
                                 }
-                            }
-                            previousCentroid = currentCentroid
-                        }
 
-                        event.changes.forEach { it.consume() }
+                                if (totalSingleFingerDistance > tapSlopPx * 0.45f ||
+                                    isMovingCursor ||
+                                    isTapDragActive ||
+                                    gestureController.isDragActive
+                                ) {
+                                    isMovingCursor = true
+                                    if (stepDist > 0f) {
+                                        gestureController.onMove(delta.x, delta.y, dtMs)
+                                    }
+                                }
+                            } else if (pointerCount >= 2 && !gestureController.isDragActive) {
+                                var sumX = 0f
+                                var sumY = 0f
+                                for (change in activeChanges) {
+                                    sumX += change.position.x
+                                    sumY += change.position.y
+                                }
+                                val currentCentroid = Offset(
+                                    x = sumX / pointerCount,
+                                    y = sumY / pointerCount
+                                )
+
+                                val prev = previousCentroid
+                                if (pointerCount == 2 && maxPointerCount == 2 && prev != null) {
+                                    val scrollDelta = currentCentroid - prev
+                                    val stepScroll = hypot(scrollDelta.x, scrollDelta.y)
+                                    totalTwoFingerDistance += stepScroll
+                                    if (totalTwoFingerDistance > scrollSlopPx && stepScroll > 0f) {
+                                        gestureController.onTwoFingerScroll(scrollDelta.x, scrollDelta.y)
+                                    }
+                                } else if (pointerCount == 3 && maxPointerCount == 3) {
+                                    val start3 = threeFingerStartCentroid
+                                    if (start3 == null) {
+                                        threeFingerStartCentroid = currentCentroid
+                                    } else {
+                                        if (prev != null) {
+                                            val step3 = currentCentroid - prev
+                                            totalThreeFingerDistance += hypot(step3.x, step3.y)
+                                        }
+                                        val totalDelta = currentCentroid - start3
+                                        if (!threeFingerSwipeTriggered &&
+                                            abs(totalDelta.y) >= threeFingerSwipeThresholdPx &&
+                                            abs(totalDelta.y) > abs(totalDelta.x) * 1.2f
+                                        ) {
+                                            threeFingerSwipeTriggered = true
+                                            lastSingleTapUpTime = 0L
+                                            val handled = if (totalDelta.y > 0f) {
+                                                gestureController.onThreeFingerSwipeDown()
+                                            } else {
+                                                gestureController.onThreeFingerSwipeUp()
+                                            }
+                                            if (handled) {
+                                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                            }
+                                        }
+                                    }
+                                }
+                                previousCentroid = currentCentroid
+                            }
+
+                            event.changes.forEach { it.consume() }
+                        }
+                    } finally {
+                        if (isTapDragActive) {
+                            gestureController.onDragEnd(GestureController.DragOwner.TOUCHPAD)
+                        }
                     }
 
                     val gestureDuration = lastEventTime - downTime
 
-                    if (isTapDragActive) {
-                        gestureController.onDragEnd()
-                    } else if (!threeFingerSwipeTriggered) {
+                    if (!isTapDragActive && !threeFingerSwipeTriggered && !gestureController.isDragActive) {
                         when {
                             maxPointerCount == 1 &&
                                 totalSingleFingerDistance <= tapSlopPx &&
@@ -806,6 +870,7 @@ private fun TrackpadButtonBar(
                 )
                 .pointerInput(enabled, gestureController) {
                     if (!enabled) return@pointerInput
+                    val holdThresholdMs = 180L
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
                         down.consume()
@@ -813,25 +878,54 @@ private fun TrackpadButtonBar(
                         var holdDragStarted = false
                         var upTime = downTime
 
-                        while (true) {
-                            val event = awaitPointerEvent(PointerEventPass.Main)
-                            val pressed = event.changes.filter { it.pressed }
-                            if (pressed.isEmpty()) break
-                            upTime = pressed.maxOf { it.uptimeMillis }
-                            if (!holdDragStarted && upTime - downTime >= 180L) {
-                                if (gestureController.onDragStart()) {
-                                    holdDragStarted = true
-                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        try {
+                            while (true) {
+                                val elapsed = (SystemClock.uptimeMillis() - downTime).coerceAtLeast(0L)
+                                val remaining = holdThresholdMs - elapsed
+                                if (remaining <= 0L) {
+                                    if (gestureController.onDragStart(GestureController.DragOwner.CLICK_BUTTON)) {
+                                        holdDragStarted = true
+                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    }
+                                    break
                                 }
-                            }
-                            event.changes.forEach { it.consume() }
-                        }
 
-                        if (holdDragStarted) {
-                            gestureController.onDragEnd()
-                        } else if (upTime - downTime < 180L) {
-                            if (gestureController.onTap()) {
-                                view.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
+                                val event = withTimeoutOrNull(remaining) {
+                                    awaitPointerEvent(PointerEventPass.Main)
+                                }
+                                if (event == null) {
+                                    if (gestureController.onDragStart(GestureController.DragOwner.CLICK_BUTTON)) {
+                                        holdDragStarted = true
+                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    }
+                                    break
+                                }
+
+                                val pressed = event.changes.filter { it.pressed }
+                                if (pressed.isEmpty()) {
+                                    upTime = event.changes.maxOfOrNull { it.uptimeMillis } ?: upTime
+                                    event.changes.forEach { it.consume() }
+                                    if (upTime - downTime < holdThresholdMs) {
+                                        if (gestureController.onTap()) {
+                                            view.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
+                                        }
+                                    }
+                                    return@awaitEachGesture
+                                }
+
+                                upTime = pressed.maxOf { it.uptimeMillis }
+                                event.changes.forEach { it.consume() }
+                            }
+
+                            while (true) {
+                                val event = awaitPointerEvent(PointerEventPass.Main)
+                                val pressed = event.changes.filter { it.pressed }
+                                event.changes.forEach { it.consume() }
+                                if (pressed.isEmpty()) break
+                            }
+                        } finally {
+                            if (holdDragStarted) {
+                                gestureController.onDragEnd(GestureController.DragOwner.CLICK_BUTTON)
                             }
                         }
                     }

@@ -87,13 +87,29 @@ class GestureController {
         return service.performAppSwitch()
     }
 
-    fun onDragStart(): Boolean {
+    /** Identifies which touch surface is holding the injected drag pointer down. */
+    enum class DragOwner { TOUCHPAD, CLICK_BUTTON }
+
+    private val dragOwners = mutableSetOf<DragOwner>()
+
+    val isDragActive: Boolean
+        get() = TouchpadAccessibilityService.instance?.isDragActive() == true
+
+    fun onDragStart(owner: DragOwner): Boolean {
         val service = TouchpadAccessibilityService.instance ?: return false
-        return service.startDrag()
+        if (!service.isDragActive()) {
+            dragOwners.clear()
+        }
+        if (!service.startDrag()) return false
+        dragOwners += owner
+        return true
     }
 
-    fun onDragEnd() {
-        TouchpadAccessibilityService.instance?.endDrag()
+    fun onDragEnd(owner: DragOwner) {
+        if (!dragOwners.remove(owner)) return
+        if (dragOwners.isEmpty()) {
+            TouchpadAccessibilityService.instance?.endDrag()
+        }
     }
 
     fun onTwoFingerScroll(scrollDx: Float, scrollDy: Float) {
