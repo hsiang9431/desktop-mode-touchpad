@@ -49,9 +49,6 @@ class ExternalTextBridge(
     private val _session = MutableStateFlow<ExternalTextSession?>(null)
     val session: StateFlow<ExternalTextSession?> = _session.asStateFlow()
 
-    var isExternalActionInFlight: Boolean = false
-        private set
-
     // Last user-clicked position on the external display (quietly recorded, never opens keyboard)
     private var lastTapDisplayId: Int = Display.INVALID_DISPLAY
     private var lastTapPoint: PointF? = null
@@ -74,7 +71,6 @@ class ExternalTextBridge(
     private var api33Helper: Any? = null
 
     private val restorePhoneKeyboardRunnable: Runnable = Runnable {
-        isExternalActionInFlight = false
         val current = _session.value
         if (current != null) {
             onAllowPhoneSoftKeyboard()
@@ -104,7 +100,6 @@ class ExternalTextBridge(
             windowTitle = hitWin?.title?.toString()
         )
 
-        isExternalActionInFlight = false
         onAllowPhoneSoftKeyboard()
         _session.value = current.copy(
             displayId = lastTapDisplayId,
@@ -118,8 +113,6 @@ class ExternalTextBridge(
         val action = pendingAction ?: return@Runnable
         pendingAction = null
         mainHandler.removeCallbacks(fallbackSetTextRunnable)
-        // First try AccessibilityNodeInfo ACTION_SET_TEXT if an editable node exists;
-        // otherwise commit directly onto the active connection (e.g. terminal / canvas app).
         if (!forceViaAccessibilityNode(action)) {
             if (executeDirectImeCommitNow(action)) {
                 markTargetModifiedAfterAction(action)
@@ -150,7 +143,6 @@ class ExternalTextBridge(
     fun clearAll() {
         cancelPendingCallbacks()
         pendingAction = null
-        isExternalActionInFlight = false
         targetNode = null
         targetPackage = null
         hasModifiedTargetInSession = false
@@ -162,7 +154,6 @@ class ExternalTextBridge(
     fun dismissKeyboardSession() {
         cancelPendingCallbacks()
         pendingAction = null
-        isExternalActionInFlight = false
         _session.value = null
         onSuppressExternalSoftKeyboard()
     }
@@ -176,20 +167,20 @@ class ExternalTextBridge(
 
     /**
      * Called right BEFORE dispatching a user tap on the external display.
-     * Suppresses the external onscreen keyboard, records tap coordinates, and if the
-     * phone keyboard relay bar is already open, refreshes the selected box & restores
-     * Gboard focus on the phone right after the tap lands.
+     * When the phone keyboard session is closed, keeps external onscreen keyboard suppressed.
+     * When the phone keyboard session is open, updates the selected target box and keeps the
+     * phone keyboard focused without toggling SHOW_MODE_HIDDEN (avoiding any Gboard flicker).
      */
     fun onBeforeExternalTap(displayId: Int, x: Float, y: Float) {
         if (displayId == Display.INVALID_DISPLAY) return
-        onSuppressExternalSoftKeyboard()
         lastTapDisplayId = displayId
         lastTapPoint = PointF(x, y)
 
-        if (_session.value != null) {
-            isExternalActionInFlight = true
+        if (_session.value == null) {
+            onSuppressExternalSoftKeyboard()
+        } else {
             mainHandler.removeCallbacks(postTapRefreshRunnable)
-            mainHandler.postDelayed(postTapRefreshRunnable, 135L)
+            mainHandler.postDelayed(postTapRefreshRunnable, 115L)
         }
     }
 
@@ -222,7 +213,6 @@ class ExternalTextBridge(
             windowTitle = resolvedWin?.title?.toString()
         )
 
-        isExternalActionInFlight = false
         onAllowPhoneSoftKeyboard()
 
         _session.value = ExternalTextSession(
@@ -246,8 +236,6 @@ class ExternalTextBridge(
             hitTestEditableNode(it, fallbackX.toInt(), fallbackY.toInt(), slopPx = 10, depth = 0)
         }
 
-        // Prefer hitNode if user specifically tapped an editable node at fallbackX/Y;
-        // otherwise use the currently input-focused editable node on that display.
         val resolvedNode = hitNode ?: focusedMatch?.first
         val resolvedWin = if (hitNode != null) hitWin else (focusedMatch?.second ?: hitWin)
 
@@ -307,8 +295,9 @@ class ExternalTextBridge(
     }
 
     /**
-     * Forces the user's typed text straight into the selected text box on the external display,
-     * while keeping the phone keyboard bar open and suppressing any onscreen keyboard on the external display.
+     * Forces the user's typed text straight into the selected text box on the external display.
+     * Uses direct AccessibilityNodeInfo actions first so the phone never loses window focus
+     * and Gboard never flickers.
      */
     fun forceInputIntoSelectedBox(
         text: String,
@@ -318,8 +307,7 @@ class ExternalTextBridge(
         if (displayId == Display.INVALID_DISPLAY) return
         if (text.isEmpty() && !sendEnterAfter) return
 
-        val hadSelection = targetInitialSelStart >= 0 &&
-            targetInitialSelEnd > targetInitialSelStart
+        val hadSelection = targetInitialSelStart in 0..<targetInitialSelEnd
 
         val action = PendingForceInputAction(
             displayId = displayId,
@@ -336,11 +324,11 @@ class ExternalTextBridge(
             editorAction = targetEditorAction,
         )
 
-        enqueueForceAction(action)
+        executeFlickerFreeOrFallback(action)
     }
 
     /**
-     * Clears all text inside the selected external text box while keeping the phone keyboard open.
+     * Clears all text inside the selected external text box without closing or flickering Gboard.
      */
     fun clearSelectedBox() {
         val displayId = targetDisplayId
@@ -354,11 +342,11 @@ class ExternalTextBridge(
             clearAllText = true,
         )
 
-        enqueueForceAction(action)
+        executeFlickerFreeOrFallback(action)
     }
 
     /**
-     * Deletes one character inside the selected external text box while keeping the phone keyboard open.
+     * Deletes one character inside the selected external text box without closing or flickering Gboard.
      */
     fun sendBackspaceToSelectedBox() {
         val displayId = targetDisplayId
@@ -373,59 +361,60 @@ class ExternalTextBridge(
             appendAtEnd = hasModifiedTargetInSession,
         )
 
-        enqueueForceAction(action)
+        executeFlickerFreeOrFallback(action)
     }
 
-    private fun enqueueForceAction(action: PendingForceInputAction) {
+    /**
+     * Primary path: execute directly on the external AccessibilityNodeInfo while the phone
+     * retains 100% of window & IME focus (zero Gboard dip/flicker).
+     * Fallback path: only used for non-accessibility surfaces (e.g. raw canvas/terminal).
+     */
+    private fun executeFlickerFreeOrFallback(action: PendingForceInputAction) {
+        // 1. If API 33+ InputMethod somehow already has an active external connection (e.g. per-display focus), use it directly.
+        if (executeDirectImeCommitIfConnected(action)) {
+            markTargetModifiedAfterAction(action)
+            return
+        }
+
+        // 2. Primary flicker-free path: perform ACTION_SET_TEXT / ACTION_IME_ENTER directly on the external node
+        // without changing SoftKeyboardController mode and without tapping away phone window focus!
+        val directResult = tryDirectAccessibilityNodeAction(action)
+        if (directResult == DirectNodeResult.COMPLETE) {
+            return
+        }
+
+        // If text was already inserted via ACTION_SET_TEXT and only single-line Enter remained unhandled:
+        val remainingAction = if (directResult == DirectNodeResult.TEXT_DONE_NEEDS_ENTER) {
+            action.copy(
+                textToInsert = null,
+                clearAllText = false,
+                deleteBeforeLength = 0,
+                sendEnterAfter = true,
+            )
+        } else {
+            action
+        }
+
+        enqueueImeConnectionFallback(remainingAction)
+    }
+
+    private fun enqueueImeConnectionFallback(action: PendingForceInputAction) {
         mainHandler.removeCallbacks(typeNullGraceRunnable)
         mainHandler.removeCallbacks(fallbackSetTextRunnable)
         mainHandler.removeCallbacks(restorePhoneKeyboardRunnable)
 
-        // Block any onscreen keyboard on the external display before touching/focusing it
-        isExternalActionInFlight = true
-        onSuppressExternalSoftKeyboard()
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (executeDirectImeCommitIfConnected(action)) {
-                markTargetModifiedAfterAction(action)
-                scheduleRestorePhoneKeyboard()
-                return
-            }
-
             pendingAction = action
-            mainHandler.postDelayed(fallbackSetTextRunnable, 420L)
-
-            // Wait 55ms so InputMethodManagerService applies SHOW_MODE_HIDDEN first,
-            // then tap the external text box so it gains focus without showing an external IME.
-            mainHandler.postDelayed(
-                {
-                    if (pendingAction === action) {
-                        if (executeDirectImeCommitIfConnected(action)) {
-                            pendingAction = null
-                            mainHandler.removeCallbacks(fallbackSetTextRunnable)
-                            markTargetModifiedAfterAction(action)
-                            scheduleRestorePhoneKeyboard()
-                        } else {
-                            dispatchInternalTap(action.displayId, action.anchorX, action.anchorY)
-                        }
-                    }
-                },
-                55L
-            )
+            mainHandler.postDelayed(fallbackSetTextRunnable, 360L)
+            dispatchInternalTap(action.displayId, action.anchorX, action.anchorY)
         } else {
-            // API 26-32 fallback: focus external text box with SHOW_MODE_HIDDEN and apply ACTION_SET_TEXT
+            dispatchInternalTap(action.displayId, action.anchorX, action.anchorY)
             mainHandler.postDelayed(
                 {
-                    dispatchInternalTap(action.displayId, action.anchorX, action.anchorY)
-                    mainHandler.postDelayed(
-                        {
-                            forceViaAccessibilityNode(action)
-                            scheduleRestorePhoneKeyboard()
-                        },
-                        110L
-                    )
+                    forceViaAccessibilityNode(action)
+                    scheduleRestorePhoneKeyboard()
                 },
-                55L
+                95L,
             )
         }
     }
@@ -442,7 +431,7 @@ class ExternalTextBridge(
 
     private fun scheduleRestorePhoneKeyboard() {
         mainHandler.removeCallbacks(restorePhoneKeyboardRunnable)
-        mainHandler.postDelayed(restorePhoneKeyboardRunnable, 50L)
+        mainHandler.postDelayed(restorePhoneKeyboardRunnable, 35L)
     }
 
     internal fun onExternalInputStartedFromIme(
@@ -462,7 +451,6 @@ class ExternalTextBridge(
         }
 
         if (hasEditorClass) {
-            // Real text input connection on the external app is ready! Commit immediately!
             pendingAction = null
             mainHandler.removeCallbacks(typeNullGraceRunnable)
             mainHandler.removeCallbacks(fallbackSetTextRunnable)
@@ -478,10 +466,8 @@ class ExternalTextBridge(
             }
             scheduleRestorePhoneKeyboard()
         } else {
-            // Window container reported TYPE_NULL first (common in Chrome WebView ~30ms before
-            // the inner <input> reports its real InputConnection). Give the real <input> 110ms!
             mainHandler.removeCallbacks(typeNullGraceRunnable)
-            mainHandler.postDelayed(typeNullGraceRunnable, 110L)
+            mainHandler.postDelayed(typeNullGraceRunnable, 100L)
         }
     }
 
@@ -497,12 +483,25 @@ class ExternalTextBridge(
         return helper.executeNow(action)
     }
 
-    private fun forceViaAccessibilityNode(action: PendingForceInputAction): Boolean {
+    private enum class DirectNodeResult {
+        COMPLETE,
+        TEXT_DONE_NEEDS_ENTER,
+        UNSUPPORTED,
+    }
+
+    private fun tryDirectAccessibilityNodeAction(action: PendingForceInputAction): DirectNodeResult {
         val node = resolveNodeForForceSetText(action.displayId, action.anchorX, action.anchorY)
-            ?: return false
+            ?: return DirectNodeResult.UNSUPPORTED
         node.refresh()
 
-        var handled = false
+        // Appending/deleting on an already-populated masked password box cannot read existing plaintext via AccessibilityNodeInfo
+        if (node.isPassword && !action.clearAllText) {
+            val needsExistingPasswordText = action.appendAtEnd || action.deleteBeforeLength > 0
+            if (needsExistingPasswordText) {
+                return DirectNodeResult.UNSUPPORTED
+            }
+        }
+
         val currentText = if (node.isShowingHintText || node.isPassword) {
             ""
         } else {
@@ -513,13 +512,26 @@ class ExternalTextBridge(
             val setArgs = Bundle().apply {
                 putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
             }
-            handled = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, setArgs)
-            if (handled) {
-                targetInitialSelStart = 0
-                targetInitialSelEnd = 0
-                hasModifiedTargetInSession = true
-            }
-        } else if (!action.textToInsert.isNullOrEmpty()) {
+            val cleared = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, setArgs)
+            if (!cleared) return DirectNodeResult.UNSUPPORTED
+            targetInitialSelStart = 0
+            targetInitialSelEnd = 0
+            hasModifiedTargetInSession = true
+            return DirectNodeResult.COMPLETE
+        }
+
+        val isMultiLineField = node.isMultiLine
+        val effectiveInsertText = when {
+            !action.textToInsert.isNullOrEmpty() && action.sendEnterAfter && isMultiLineField ->
+                action.textToInsert + "\n"
+            action.textToInsert.isNullOrEmpty() && action.sendEnterAfter && isMultiLineField ->
+                "\n"
+            else -> action.textToInsert
+        }
+
+        var textStepSucceeded = false
+
+        if (!effectiveInsertText.isNullOrEmpty()) {
             val rawStart = if (!action.appendAtEnd && node.textSelectionStart >= 0) {
                 node.textSelectionStart
             } else {
@@ -534,61 +546,86 @@ class ExternalTextBridge(
             val newText: String
             val newCursor: Int
             if (currentText.isEmpty()) {
-                newText = action.textToInsert
+                newText = effectiveInsertText
                 newCursor = newText.length
             } else if (action.appendAtEnd) {
-                newText = currentText + action.textToInsert
+                newText = currentText + effectiveInsertText
                 newCursor = newText.length
             } else {
                 val s = if (rawStart in 0..currentText.length) rawStart else currentText.length
                 val e = if (rawEnd in s..currentText.length) rawEnd else s
-                newText = currentText.replaceRange(s, e, action.textToInsert)
-                newCursor = s + action.textToInsert.length
+                newText = currentText.replaceRange(s, e, effectiveInsertText)
+                newCursor = s + effectiveInsertText.length
             }
 
             val setArgs = Bundle().apply {
                 putCharSequence(
                     AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                    newText
+                    newText,
                 )
             }
-            handled = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, setArgs)
-            if (handled) {
-                targetInitialSelStart = newCursor
-                targetInitialSelEnd = newCursor
-                hasModifiedTargetInSession = true
-                if (newCursor in 0..newText.length) {
-                    val selArgs = Bundle().apply {
-                        putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, newCursor)
-                        putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, newCursor)
-                    }
-                    node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selArgs)
+            textStepSucceeded = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, setArgs)
+            if (!textStepSucceeded) return DirectNodeResult.UNSUPPORTED
+
+            targetInitialSelStart = newCursor
+            targetInitialSelEnd = newCursor
+            hasModifiedTargetInSession = true
+            if (newCursor in 0..newText.length) {
+                val selArgs = Bundle().apply {
+                    putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, newCursor)
+                    putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, newCursor)
                 }
+                node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selArgs)
             }
-        } else if (action.deleteBeforeLength > 0 && currentText.isNotEmpty()) {
+        } else if (action.deleteBeforeLength > 0) {
+            if (currentText.isEmpty()) {
+                return DirectNodeResult.COMPLETE
+            }
             val newText = currentText.dropLast(action.deleteBeforeLength.coerceAtMost(currentText.length))
             val setArgs = Bundle().apply {
                 putCharSequence(
                     AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                    newText
+                    newText,
                 )
             }
-            handled = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, setArgs)
-            if (handled) {
-                targetInitialSelStart = newText.length
-                targetInitialSelEnd = newText.length
-                hasModifiedTargetInSession = true
+            val deleted = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, setArgs)
+            if (!deleted) return DirectNodeResult.UNSUPPORTED
+
+            targetInitialSelStart = newText.length
+            targetInitialSelEnd = newText.length
+            hasModifiedTargetInSession = true
+            if (newText.isNotEmpty()) {
+                val selArgs = Bundle().apply {
+                    putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, newText.length)
+                    putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, newText.length)
+                }
+                node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selArgs)
+            }
+            return DirectNodeResult.COMPLETE
+        }
+
+        if (action.sendEnterAfter && !isMultiLineField) {
+            val enterHandled = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                node.refresh()
+                node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+            } else {
+                false
+            }
+            if (!enterHandled) {
+                return if (textStepSucceeded) {
+                    DirectNodeResult.TEXT_DONE_NEEDS_ENTER
+                } else {
+                    DirectNodeResult.UNSUPPORTED
+                }
             }
         }
 
-        if (action.sendEnterAfter && (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)) {
-            node.refresh()
-            handled = node.performAction(
-                AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id
-            ) || handled
-        }
+        return DirectNodeResult.COMPLETE
+    }
 
-        return handled
+    private fun forceViaAccessibilityNode(action: PendingForceInputAction): Boolean {
+        val res = tryDirectAccessibilityNodeAction(action)
+        return res == DirectNodeResult.COMPLETE || res == DirectNodeResult.TEXT_DONE_NEEDS_ENTER
     }
 
     private fun resolveNodeForForceSetText(
@@ -596,17 +633,27 @@ class ExternalTextBridge(
         anchorX: Float,
         anchorY: Float,
     ): AccessibilityNodeInfo? {
-        val focused = findFocusedEditableOnDisplay(displayId)?.first
-        if (focused != null) return focused
-
         val saved = targetNode
         if (saved != null && saved.refresh() && isEditableNode(saved)) {
             return saved
         }
 
         val win = findTopWindowAtPoint(displayId, anchorX.toInt(), anchorY.toInt())
-        val root = win?.root ?: return null
-        return hitTestEditableNode(root, anchorX.toInt(), anchorY.toInt(), slopPx = 12, depth = 0)
+        val hit = win?.root?.let {
+            hitTestEditableNode(it, anchorX.toInt(), anchorY.toInt(), slopPx = 12, depth = 0)
+        }
+        if (hit != null) {
+            targetNode = hit
+            return hit
+        }
+
+        val focused = findFocusedEditableOnDisplay(displayId)?.first
+        if (focused != null) {
+            targetNode = focused
+            return focused
+        }
+
+        return null
     }
 
     private fun findFocusedEditableOnDisplay(
@@ -749,7 +796,7 @@ private class Api33InputMethodBridge(
             bridge.onExternalInputStartedFromIme(
                 packageName = pkg,
                 inputType = attribute.inputType,
-                imeOptions = attribute.imeOptions
+                imeOptions = attribute.imeOptions,
             )
         }
 
@@ -765,10 +812,8 @@ private class Api33InputMethodBridge(
         if ((activeExternalInputType and InputType.TYPE_MASK_CLASS) == InputType.TYPE_NULL) {
             return false
         }
-        if (action.targetPackage != null && action.targetPackage != currentPkg) {
-            return false
-        }
-        return executeNow(action)
+        return (action.targetPackage == null || action.targetPackage == currentPkg) &&
+            executeNow(action)
     }
 
     fun executeNow(action: PendingForceInputAction): Boolean {
@@ -801,8 +846,6 @@ private class Api33InputMethodBridge(
                     surrounding.selectionStart == 0 &&
                     surrounding.selectionEnd == surrounding.text.length
                 ) {
-                    // Prevent selectAllOnFocus (e.g. browser URL bars) from overwriting existing text
-                    // when re-focused unless the text was already selected when keyboard opened.
                     val pos = if (action.initialCursorPos in 0..totalEnd) {
                         action.initialCursorPos
                     } else {
@@ -833,9 +876,9 @@ private class Api33InputMethodBridge(
 
         if (action.sendEnterAfter) {
             val explicitAction = action.editorAction
-            val hasExplicitAction = explicitAction != EditorInfo.IME_ACTION_NONE &&
-                explicitAction != EditorInfo.IME_ACTION_UNSPECIFIED &&
-                explicitAction != EditorInfo.IME_ACTION_DONE
+            val hasExplicitAction = (explicitAction != EditorInfo.IME_ACTION_NONE) &&
+                (explicitAction != EditorInfo.IME_ACTION_UNSPECIFIED) &&
+                (explicitAction != EditorInfo.IME_ACTION_DONE)
             if (hasExplicitAction) {
                 ic.performEditorAction(explicitAction)
             } else {

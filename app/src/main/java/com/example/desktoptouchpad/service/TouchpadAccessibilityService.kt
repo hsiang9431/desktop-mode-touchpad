@@ -35,7 +35,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
     private var isPhoneKeyboardAllowed = false
 
     private val showModeListener = SoftKeyboardController.OnShowModeChangedListener { _, showMode ->
-        if (shouldSuppressExternalSoftKeyboard() && showMode != SHOW_MODE_HIDDEN) {
+        if (shouldSuppressExternalSoftKeyboard() && (showMode != SHOW_MODE_HIDDEN)) {
             applySoftKeyboardShowMode(SHOW_MODE_HIDDEN)
         }
     }
@@ -94,10 +94,8 @@ class TouchpadAccessibilityService : AccessibilityService() {
         serviceScope.launch {
             externalTextBridge.session.collect { session ->
                 _textSession.value = session
-                if (session == null) {
-                    isPhoneKeyboardAllowed = false
-                    syncSoftKeyboardMode()
-                }
+                isPhoneKeyboardAllowed = (session != null)
+                syncSoftKeyboardMode()
             }
         }
     }
@@ -150,7 +148,10 @@ class TouchpadAccessibilityService : AccessibilityService() {
     }
 
     private fun shouldSuppressExternalSoftKeyboard(): Boolean {
-        return (_externalDisplay.value != null) && isMainActivityStarted && !isPhoneKeyboardAllowed
+        return (_externalDisplay.value != null) &&
+            isMainActivityStarted &&
+            !isPhoneKeyboardAllowed &&
+            (_textSession.value == null)
     }
 
     private fun applySoftKeyboardShowMode(desiredMode: Int) {
@@ -171,6 +172,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
     }
 
     fun suppressExternalSoftKeyboard() {
+        if (_textSession.value != null) return
         isPhoneKeyboardAllowed = false
         syncSoftKeyboardMode()
     }
@@ -182,17 +184,6 @@ class TouchpadAccessibilityService : AccessibilityService() {
         applySoftKeyboardShowMode(SHOW_MODE_AUTO)
     }
 
-    fun onPhoneKeyboardWindowFocusChanged(hasPhoneWindowFocus: Boolean) {
-        if (hasPhoneWindowFocus) {
-            if (_textSession.value != null && !externalTextBridge.isExternalActionInFlight) {
-                allowPhoneSoftKeyboard()
-            }
-        } else {
-            // Phone window lost focus to external display: immediately block external onscreen keyboard
-            suppressExternalSoftKeyboard()
-        }
-    }
-
     fun requestManualKeyboard(): Boolean {
         val displayId = activeTargetDisplayId() ?: return false
         val (cursorX, cursorY) = getCursorPosition()
@@ -200,6 +191,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
     }
 
     fun dismissKeyboardSession() {
+        isPhoneKeyboardAllowed = false
         externalTextBridge.dismissKeyboardSession()
     }
 
@@ -249,7 +241,9 @@ class TouchpadAccessibilityService : AccessibilityService() {
 
     private fun performRawTap(displayId: Int, x: Float, y: Float): Boolean {
         if (isDragRequested || (activeDragStroke != null)) return false
-        suppressExternalSoftKeyboard()
+        if (_textSession.value == null) {
+            suppressExternalSoftKeyboard()
+        }
         val (clampedX, clampedY) = clampToDisplay(x, y)
         val path = Path().apply { moveTo(clampedX, clampedY) }
         val stroke = GestureDescription.StrokeDescription(path, 0L, TAP_DURATION_MS)
@@ -260,7 +254,9 @@ class TouchpadAccessibilityService : AccessibilityService() {
         val displayId = activeTargetDisplayId() ?: return false
         if (isDragRequested || (activeDragStroke != null)) return false
 
-        suppressExternalSoftKeyboard()
+        if (_textSession.value == null) {
+            suppressExternalSoftKeyboard()
+        }
         val (clampedX, clampedY) = clampToDisplay(x, y)
         val path = Path().apply { moveTo(clampedX, clampedY) }
         val stroke = GestureDescription.StrokeDescription(path, 0L, LONG_PRESS_DURATION_MS)
@@ -271,7 +267,9 @@ class TouchpadAccessibilityService : AccessibilityService() {
         val displayId = activeTargetDisplayId() ?: return false
         if (isDragRequested || (activeDragStroke != null)) return true
 
-        suppressExternalSoftKeyboard()
+        if (_textSession.value == null) {
+            suppressExternalSoftKeyboard()
+        }
         pendingScrollX = 0f
         pendingScrollY = 0f
 
@@ -333,7 +331,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
                             segmentPath,
                             0L,
                             if (keepHolding) DRAG_SLICE_DURATION_MS else DRAG_RELEASE_DURATION_MS,
-                            keepHolding
+                            keepHolding,
                         )
                     } catch (_: Exception) {
                         resetDragState()

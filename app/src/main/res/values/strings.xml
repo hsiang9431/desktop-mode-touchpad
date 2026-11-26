@@ -29,6 +29,6 @@
     <string name="btn_kb_backspace">\u232B</string>
     <string name="btn_kb_clear">Clear</string>
     <string name="btn_kb_insert">Insert</string>
-    <string name="btn_kb_insert_enter">Insert \u21B5</string>
+    <string name="btn_kb_insert_enter">Insert + Enter</string>
     <string name="btn_kb_hide">Hide</string>
 </resources>

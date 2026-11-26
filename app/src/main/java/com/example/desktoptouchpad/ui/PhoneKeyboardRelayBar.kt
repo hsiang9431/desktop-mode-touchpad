@@ -43,6 +43,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
@@ -57,12 +58,14 @@ import androidx.core.view.WindowInsetsCompat
 import com.example.desktoptouchpad.R
 import com.example.desktoptouchpad.input.ExternalTextSession
 import com.example.desktoptouchpad.service.TouchpadAccessibilityService
+import kotlin.time.Duration.Companion.milliseconds
 import kotlinx.coroutines.delay
 
 private class RelayEditText(context: Context) : EditText(context) {
     var appliedSessionId: Long = -1L
     var appliedTextColor: Int = 0
     var appliedHintColor: Int = 0
+    var isClosingKeyboard: Boolean = false
     var pendingShowSoftInputOnWindowFocus: Boolean = false
     var onBackPreIme: (() -> Unit)? = null
 
@@ -84,22 +87,26 @@ private fun Context.findActivity(): Activity? {
 }
 
 private fun showImeOnFocusedEditText(activity: Activity?, editText: RelayEditText) {
+    if (editText.isClosingKeyboard) return
     TouchpadAccessibilityService.instance?.allowPhoneSoftKeyboard()
-    editText.requestFocus()
+    if (!editText.isFocused) {
+        editText.requestFocus()
+    }
     editText.postDelayed(
         {
-            if (!editText.isAttachedToWindow) return@postDelayed
+            if (!editText.isAttachedToWindow || editText.isClosingKeyboard) return@postDelayed
             activity?.window?.let { win ->
                 WindowCompat.getInsetsController(win, editText).show(WindowInsetsCompat.Type.ime())
             }
             val imm = editText.context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
             imm.showSoftInput(editText, 0)
         },
-        30L
+        25L,
     )
 }
 
 private fun requestPhoneSoftKeyboard(activity: Activity?, editText: RelayEditText) {
+    if (editText.isClosingKeyboard) return
     TouchpadAccessibilityService.instance?.allowPhoneSoftKeyboard()
     if (editText.hasWindowFocus()) {
         editText.pendingShowSoftInputOnWindowFocus = false
@@ -127,6 +134,7 @@ private fun requestPhoneSoftKeyboard(activity: Activity?, editText: RelayEditTex
 
 private fun hidePhoneSoftKeyboard(activity: Activity?, editText: RelayEditText?) {
     if (editText == null) return
+    editText.isClosingKeyboard = true
     editText.pendingShowSoftInputOnWindowFocus = false
     val imm = editText.context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
     imm.hideSoftInputFromWindow(editText.windowToken, 0)
@@ -151,8 +159,9 @@ fun PhoneKeyboardRelayBar(
 
     LaunchedEffect(session.sessionId, session.refocusTrigger, editTextRef) {
         val view = editTextRef ?: return@LaunchedEffect
+        view.isClosingKeyboard = false
         TouchpadAccessibilityService.instance?.allowPhoneSoftKeyboard()
-        delay(35L)
+        delay(30.milliseconds)
         requestPhoneSoftKeyboard(activity, view)
     }
 
@@ -165,8 +174,8 @@ fun PhoneKeyboardRelayBar(
 
     val cardBg = if (oledSaverMode) Color(0xFF09090E) else Color(0xFF1E1E2E)
     val fieldBg = if (oledSaverMode) Color(0xFF050508) else Color(0xFF141420)
-    val borderColor = if (oledSaverMode) Color(0xFF313244) else Color(0xFF89B4FA)
-    val titleColor = if (oledSaverMode) Color(0xFF9399B2) else Color(0xFF89B4FA)
+    val borderColor = if (oledSaverMode) Color(0xFF1E1E2E) else Color(0xFF313244)
+    val titleColor = if (oledSaverMode) Color(0xFF7F849C) else Color(0xFFCDD6F4)
     val inputTextColor = if (oledSaverMode) Color(0xFFBAC2DE) else Color(0xFFCDD6F4)
     val hintTextColor = Color(0xFF6C7086)
 
@@ -174,7 +183,7 @@ fun PhoneKeyboardRelayBar(
         val view = editTextRef ?: return
         val typedText = view.text?.toString().orEmpty()
         if (typedText.isEmpty() && !sendEnterAfter) return
-        view.setText("")
+        view.text?.clear()
         TouchpadAccessibilityService.instance?.forceInputIntoSelectedBox(
             text = typedText,
             sendEnterAfter = sendEnterAfter,
@@ -212,7 +221,6 @@ fun PhoneKeyboardRelayBar(
                 RelayActionMiniButton(
                     label = stringResource(R.string.btn_kb_hide),
                     oledSaver = oledSaverMode,
-                    accent = false,
                     onClick = {
                         hidePhoneSoftKeyboard(activity, editTextRef)
                         onDismissKeyboard()
@@ -249,16 +257,38 @@ fun PhoneKeyboardRelayBar(
                             isFocusableInTouchMode = true
 
                             val focusListener = ViewTreeObserver.OnWindowFocusChangeListener { hasFocus ->
-                                TouchpadAccessibilityService.instance?.onPhoneKeyboardWindowFocusChanged(hasFocus)
-                                if (hasFocus && pendingShowSoftInputOnWindowFocus) {
-                                    pendingShowSoftInputOnWindowFocus = false
-                                    showImeOnFocusedEditText(ctx.findActivity(), this)
+                                if (isClosingKeyboard) return@OnWindowFocusChangeListener
+                                if (hasFocus) {
+                                    if (pendingShowSoftInputOnWindowFocus) {
+                                        pendingShowSoftInputOnWindowFocus = false
+                                        showImeOnFocusedEditText(ctx.findActivity(), this)
+                                    }
+                                } else {
+                                    // Keep the phone keyboard always open while this screen is visible
+                                    postDelayed(
+                                        {
+                                            val act = ctx.findActivity()
+                                            val isActivityVisible = (act as? androidx.lifecycle.LifecycleOwner)
+                                                ?.lifecycle
+                                                ?.currentState
+                                                ?.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED) != false
+                                            if (isAttachedToWindow &&
+                                                !isClosingKeyboard &&
+                                                isActivityVisible &&
+                                                !hasWindowFocus()
+                                            ) {
+                                                requestPhoneSoftKeyboard(act, this)
+                                            }
+                                        },
+                                        90L,
+                                    )
                                 }
                             }
                             viewTreeObserver.addOnWindowFocusChangeListener(focusListener)
                             tag = focusListener
 
                             onBackPreIme = {
+                                isClosingKeyboard = true
                                 latestOnDismiss()
                             }
 
@@ -292,10 +322,11 @@ fun PhoneKeyboardRelayBar(
                         view.hint = session.hintText ?: defaultPlaceholder
                         if (view.appliedSessionId != session.sessionId) {
                             view.appliedSessionId = session.sessionId
-                            view.setText("")
+                            view.text?.clear()
                         }
                     },
                     onRelease = { view ->
+                        view.isClosingKeyboard = true
                         val listener = view.tag as? ViewTreeObserver.OnWindowFocusChangeListener
                         if ((listener != null) && view.viewTreeObserver.isAlive) {
                             view.viewTreeObserver.removeOnWindowFocusChangeListener(listener)
@@ -314,10 +345,9 @@ fun PhoneKeyboardRelayBar(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 RelayActionMiniButton(
-                    modifier = Modifier.weight(0.75f),
+                    modifier = Modifier.weight(0.65f),
                     label = stringResource(R.string.btn_kb_backspace),
                     oledSaver = oledSaverMode,
-                    accent = false,
                     onClick = {
                         val view = editTextRef ?: return@RelayActionMiniButton
                         if (!view.text.isNullOrEmpty()) {
@@ -330,14 +360,13 @@ fun PhoneKeyboardRelayBar(
                 )
 
                 RelayActionMiniButton(
-                    modifier = Modifier.weight(0.95f),
+                    modifier = Modifier.weight(0.85f),
                     label = stringResource(R.string.btn_kb_clear),
                     oledSaver = oledSaverMode,
-                    accent = false,
                     onClick = {
                         val view = editTextRef ?: return@RelayActionMiniButton
                         if (!view.text.isNullOrEmpty()) {
-                            view.setText("")
+                            view.text?.clear()
                         } else {
                             TouchpadAccessibilityService.instance?.clearSelectedBox()
                         }
@@ -345,18 +374,16 @@ fun PhoneKeyboardRelayBar(
                 )
 
                 RelayActionMiniButton(
-                    modifier = Modifier.weight(1.1f),
+                    modifier = Modifier.weight(0.9f),
                     label = stringResource(R.string.btn_kb_insert),
                     oledSaver = oledSaverMode,
-                    accent = true,
                     onClick = { submitInput(sendEnterAfter = false) },
                 )
 
                 RelayActionMiniButton(
-                    modifier = Modifier.weight(1.25f),
+                    modifier = Modifier.weight(1.45f),
                     label = stringResource(R.string.btn_kb_insert_enter),
                     oledSaver = oledSaverMode,
-                    accent = true,
                     onClick = { submitInput(sendEnterAfter = true) },
                 )
             }
@@ -368,32 +395,21 @@ fun PhoneKeyboardRelayBar(
 private fun RelayActionMiniButton(
     label: String,
     oledSaver: Boolean,
-    accent: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val borderColor = when {
-        accent -> Color(0xFF89B4FA)
-        oledSaver -> Color(0xFF313244)
-        else -> Color(0xFF45475A)
-    }
-    val containerColor = when {
-        accent -> Color(0x3389B4FA)
-        else -> Color.Transparent
-    }
-    val textColor = when {
-        accent -> Color(0xFF89B4FA)
-        oledSaver -> Color(0xFF9399B2)
-        else -> Color(0xFFCDD6F4)
-    }
+    val borderColor = if (oledSaver) Color(0xFF313244) else Color(0xFF45475A)
+    val textColor = if (oledSaver) Color(0xFF9399B2) else Color(0xFFCDD6F4)
 
     OutlinedButton(
         onClick = onClick,
-        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
-        modifier = modifier.height(28.dp),
+        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+        modifier = modifier
+            .height(28.dp)
+            .focusProperties { canFocus = false },
         shape = RoundedCornerShape(8.dp),
         border = BorderStroke(1.dp, borderColor),
-        colors = ButtonDefaults.outlinedButtonColors(containerColor = containerColor),
+        colors = ButtonDefaults.outlinedButtonColors(containerColor = Color.Transparent),
     ) {
         Text(
             text = label,
