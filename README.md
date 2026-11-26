@@ -7,14 +7,14 @@ A Samsung DeX-style phone touchpad and native Gboard text-input bridge for **And
 ## Features
 
 ### Desktop Trackpad & Pointer
-- **External Display Cursor Overlay**: Automatically detects connected secondary displays (`DisplayManager`) and renders a hardware-accelerated pointer overlay (`WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY`) via `CursorOverlayManager`.
-- **Multi-Touch Gestures**:
+- **External Display Cursor Overlay**: Automatically detects connected secondary displays (`DisplayManager`) and renders Android 14 desktop vector cursors (`WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY`) via `CursorOverlayManager`, dynamically switching icons (arrow, hand pointer, text I-beam, grabbing hand, scroll, context menu, and freeform window resize arrows) with exact hotspot alignment.
+- **Multi-Touch Gestures & Configurable Options**:
   - **1-finger move & tap**: Velocity-accelerated pointer movement and left-click on the external screen.
-  - **Double-tap & hold / Left-button hold**: Continuous stroke drag-and-drop (`StrokeDescription.continueStroke`).
+  - **Double-tap & hold / Left-button hold**: Continuous stroke drag-and-drop (`StrokeDescription.continueStroke`) with an adjustable **Double-Tap Interval** slider.
   - **2-finger scroll**: Smooth vertical & horizontal scrolling with configurable natural scroll direction.
-  - **2-finger tap / Context button**: Long-press / secondary click at cursor position.
-  - **3-finger tap**: System Back action.
-- **OLED Burn-In Saver**: One-tap pure-black low-luminance mode with `FLAG_KEEP_SCREEN_ON` active while an external display is connected.
+  - **2-finger tap / Right Click button**: Secondary / right click at cursor position.
+  - **3-finger gestures (with toggle)**: 3-finger tap for Back, 3-finger swipe down for Home, and 3-finger swipe up for App Switcher — all strictly routed to the external display without minimizing the phone touchpad app.
+- **OLED Dim Theme**: Pure-black low-luminance OLED theme with `FLAG_KEEP_SCREEN_ON` active while an external display is connected, keeping both **Center** and **Options** accessible.
 
 ### Native Phone Keyboard Input for External Display
 - **Full Native Gboard Support**: Type uninterrupted in **any language** (English, CJK composition, emojis, swipe typing, voice dictation, clipboard) on your phone and send directly into your selected text box on the external monitor.
@@ -64,3 +64,6 @@ app/src/main/java/com/example/desktoptouchpad/
    Output APK: `app/build/outputs/apk/debug/app-debug.apk`
 3. Install on your phone, tap **Enable Accessibility Service**, accept the disclosure, and enable **Desktop Touchpad Service** in Android Accessibility Settings.
 4. Connect an external USB-C / HDMI / wireless Desktop Mode display.
+
+
+

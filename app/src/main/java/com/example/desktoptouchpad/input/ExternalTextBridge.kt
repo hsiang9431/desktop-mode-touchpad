@@ -490,6 +490,15 @@ class ExternalTextBridge(
         return helper.executeNow(action)
     }
 
+    fun sendKeyEventToExternalIfConnected(
+        keyCode: Int,
+        allowedExternalPackages: Set<String>,
+    ): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
+        val helper = api33Helper as? Api33InputMethodBridge ?: return false
+        return helper.sendKeyEventIfExternalConnected(keyCode, allowedExternalPackages)
+    }
+
     private enum class DirectNodeResult {
         COMPLETE,
         TEXT_DONE_NEEDS_ENTER,
@@ -821,6 +830,22 @@ private class Api33InputMethodBridge(
         }
         return (action.targetPackage == null || action.targetPackage == currentPkg) &&
             executeNow(action)
+    }
+
+    fun sendKeyEventIfExternalConnected(
+        keyCode: Int,
+        allowedExternalPackages: Set<String>,
+    ): Boolean {
+        val currentPkg = activeExternalPackage ?: return false
+        if (currentPkg == service.packageName) return false
+        if (allowedExternalPackages.isNotEmpty() && currentPkg !in allowedExternalPackages) {
+            return false
+        }
+        val ic = inputMethod.currentInputConnection ?: return false
+        val now = SystemClock.uptimeMillis()
+        ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0))
+        ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, keyCode, 0))
+        return true
     }
 
     fun executeNow(action: PendingForceInputAction): Boolean {

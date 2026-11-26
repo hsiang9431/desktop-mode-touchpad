@@ -36,12 +36,15 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.rememberSliderState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -65,11 +68,26 @@ import com.example.desktoptouchpad.overlay.ExternalDisplayInfo
 import com.example.desktoptouchpad.service.TouchpadAccessibilityService
 import com.example.desktoptouchpad.ui.PhoneKeyboardRelayBar
 import com.example.desktoptouchpad.ui.ProminentDisclosureDialog
+import kotlin.math.abs
 import kotlin.math.hypot
+import kotlin.math.roundToLong
+
+private val OledDimColorScheme = darkColorScheme(
+    primary = Color(0xFF89B4FA),
+    onPrimary = Color(0xFF09090E),
+    secondary = Color(0xFF7F849C),
+    background = Color.Black,
+    surface = Color(0xFF09090E),
+    onSurface = Color(0xFF9399B2),
+    surfaceVariant = Color(0xFF181825),
+    onSurfaceVariant = Color(0xFF6C7086),
+    outline = Color(0xFF313244),
+)
 
 class MainActivity : ComponentActivity() {
 
     private val gestureController = GestureController()
+    private var appliedWindowFocusable: Boolean = true
 
     override fun onStart() {
         super.onStart()
@@ -89,9 +107,10 @@ class MainActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
         )
         super.onCreate(savedInstanceState)
+        gestureController.attachContext(this)
 
         setContent {
-            MaterialTheme {
+            MaterialTheme(colorScheme = OledDimColorScheme) {
                 TouchpadScreen(
                     gestureController = gestureController,
                     onSetKeepScreenOn = { keepOn ->
@@ -99,6 +118,16 @@ class MainActivity : ComponentActivity() {
                             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                         } else {
                             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        }
+                    },
+                    onSetWindowFocusable = { focusable ->
+                        if (appliedWindowFocusable != focusable) {
+                            appliedWindowFocusable = focusable
+                            if (focusable) {
+                                window.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+                            } else {
+                                window.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+                            }
                         }
                     },
                     onOpenSettings = {
@@ -114,6 +143,7 @@ class MainActivity : ComponentActivity() {
 fun TouchpadScreen(
     gestureController: GestureController,
     onSetKeepScreenOn: (Boolean) -> Unit,
+    onSetWindowFocusable: (Boolean) -> Unit,
     onOpenSettings: () -> Unit
 ) {
     val isServiceActive by TouchpadAccessibilityService.isConnected.collectAsState()
@@ -123,24 +153,39 @@ fun TouchpadScreen(
 
     var showDisclosure by remember { mutableStateOf(false) }
     var showOptions by remember { mutableStateOf(false) }
-    var oledSaverMode by remember { mutableStateOf(false) }
     var sensitivity by remember { mutableFloatStateOf(gestureController.sensitivity) }
+    var doubleTapIntervalMs by remember { mutableLongStateOf(gestureController.doubleTapIntervalMs) }
     var naturalScrolling by remember { mutableStateOf(gestureController.naturalScrolling) }
+    var threeFingerGesturesEnabled by remember {
+        mutableStateOf(gestureController.threeFingerGesturesEnabled)
+    }
 
     val isDesktopReady = isServiceActive && externalDisplay != null
     val activeTextSession = textSession
     val isKeyboardRelayVisible = isDesktopReady && activeTextSession != null
+
+    // Keep WindowManager's top display focus on the external display while acting as a touchpad,
+    // and only make the phone window focusable when Gboard relay or a dialog needs focus.
+    val shouldPhoneWindowBeFocusable = !isDesktopReady || isKeyboardRelayVisible || showDisclosure
+
+    SideEffect {
+        onSetWindowFocusable(shouldPhoneWindowBeFocusable)
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            onSetWindowFocusable(true)
+        }
+    }
 
     DisposableEffect(isDesktopReady) {
         onSetKeepScreenOn(isDesktopReady)
         onDispose { onSetKeepScreenOn(false) }
     }
 
-    val backgroundColor = if (oledSaverMode) Color.Black else Color(0xFF11111B)
-
     Surface(
         modifier = Modifier.fillMaxSize(),
-        color = backgroundColor
+        color = Color.Black
     ) {
         BoxWithConstraints(
             modifier = Modifier
@@ -158,26 +203,34 @@ fun TouchpadScreen(
                     StatusHeaderCard(
                         isServiceActive = isServiceActive,
                         externalDisplay = externalDisplay,
-                        oledSaverMode = oledSaverMode,
                         showOptions = showOptions,
                         onEnableServiceClick = { showDisclosure = true },
                         onCenterCursor = { gestureController.onCenterCursor() },
-                        onToggleOptions = { showOptions = !showOptions },
-                        onToggleOledSaver = { oledSaverMode = !oledSaverMode }
+                        onToggleOptions = { showOptions = !showOptions }
                     )
 
-                    if (showOptions && !oledSaverMode && !isKeyboardRelayVisible) {
+                    if (showOptions && !isKeyboardRelayVisible) {
                         Spacer(modifier = Modifier.height(8.dp))
                         TouchpadOptionsPanel(
                             sensitivity = sensitivity,
+                            doubleTapIntervalMs = doubleTapIntervalMs,
                             naturalScrolling = naturalScrolling,
+                            threeFingerGesturesEnabled = threeFingerGesturesEnabled,
                             onSensitivityChange = { value ->
                                 sensitivity = value
                                 gestureController.sensitivity = value
                             },
+                            onDoubleTapIntervalChange = { valueMs ->
+                                doubleTapIntervalMs = valueMs
+                                gestureController.doubleTapIntervalMs = valueMs
+                            },
                             onNaturalScrollingChange = { enabled ->
                                 naturalScrolling = enabled
                                 gestureController.naturalScrolling = enabled
+                            },
+                            onThreeFingerGesturesChange = { enabled ->
+                                threeFingerGesturesEnabled = enabled
+                                gestureController.threeFingerGesturesEnabled = enabled
                             }
                         )
                     }
@@ -192,7 +245,7 @@ fun TouchpadScreen(
                     gestureController = gestureController,
                     isDesktopReady = isDesktopReady,
                     isDragging = isDragging,
-                    oledSaverMode = oledSaverMode,
+                    threeFingerGesturesEnabled = threeFingerGesturesEnabled,
                     compactHint = isKeyboardRelayVisible
                 )
 
@@ -200,7 +253,7 @@ fun TouchpadScreen(
                     Spacer(modifier = Modifier.height(8.dp))
                     PhoneKeyboardRelayBar(
                         session = activeTextSession,
-                        oledSaverMode = oledSaverMode,
+                        oledSaverMode = true,
                         onDismissKeyboard = {
                             gestureController.onDismissKeyboard()
                         }
@@ -212,10 +265,12 @@ fun TouchpadScreen(
 
                     TrackpadButtonBar(
                         enabled = isDesktopReady,
-                        oledSaverMode = oledSaverMode,
                         isDragging = isDragging,
                         isKeyboardOpen = isKeyboardRelayVisible,
-                        gestureController = gestureController
+                        gestureController = gestureController,
+                        onPreparePhoneFocusForKeyboard = {
+                            onSetWindowFocusable(true)
+                        }
                     )
                 }
             }
@@ -239,24 +294,17 @@ fun TouchpadScreen(
 private fun StatusHeaderCard(
     isServiceActive: Boolean,
     externalDisplay: ExternalDisplayInfo?,
-    oledSaverMode: Boolean,
     showOptions: Boolean,
     onEnableServiceClick: () -> Unit,
     onCenterCursor: () -> Unit,
-    onToggleOptions: () -> Unit,
-    onToggleOledSaver: () -> Unit
+    onToggleOptions: () -> Unit
 ) {
-    val cardColor = when {
-        oledSaverMode -> Color(0xFF09090E)
-        externalDisplay != null && isServiceActive -> Color(0xFF1E1E2E)
-        isServiceActive -> Color(0xFF2A2433)
-        else -> Color(0xFF31222C)
-    }
+    val isDesktopReady = isServiceActive && externalDisplay != null
 
     Card(
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = cardColor),
-        border = if (oledSaverMode) BorderStroke(1.dp, Color(0xFF1E1E2E)) else null
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF09090E)),
+        border = BorderStroke(1.dp, Color(0xFF1E1E2E))
     ) {
         Column(
             modifier = Modifier
@@ -268,7 +316,11 @@ private fun StatusHeaderCard(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Column(modifier = Modifier.weight(1f)) {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(end = 8.dp)
+                ) {
                     val statusText = when {
                         isServiceActive && externalDisplay != null -> stringResource(
                             R.string.service_status_active,
@@ -280,17 +332,16 @@ private fun StatusHeaderCard(
                         else -> stringResource(R.string.service_status_inactive)
                     }
                     val statusColor = when {
-                        oledSaverMode -> Color(0xFF6C7086)
-                        isServiceActive && externalDisplay != null -> Color(0xFFA6E3A1)
-                        isServiceActive -> Color(0xFFF9E2AF)
-                        else -> Color(0xFFF38BA8)
+                        isServiceActive && externalDisplay != null -> Color(0xFF6C7086)
+                        isServiceActive -> Color(0xFFA6997A)
+                        else -> Color(0xFFB86B82)
                     }
 
                     Text(
                         text = stringResource(R.string.app_name),
                         fontSize = 16.sp,
                         fontWeight = FontWeight.Bold,
-                        color = if (oledSaverMode) Color(0xFF7F849C) else Color(0xFFCDD6F4)
+                        color = Color(0xFF7F849C)
                     )
                     Text(
                         text = statusText,
@@ -301,28 +352,18 @@ private fun StatusHeaderCard(
                 }
 
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    if (isServiceActive && externalDisplay != null) {
-                        SmallControlChip(
-                            label = stringResource(R.string.btn_center_cursor),
-                            active = false,
-                            oledSaver = oledSaverMode,
-                            onClick = onCenterCursor
-                        )
-                    }
                     SmallControlChip(
-                        label = stringResource(R.string.btn_oled_saver),
-                        active = oledSaverMode,
-                        oledSaver = oledSaverMode,
-                        onClick = onToggleOledSaver
+                        label = stringResource(R.string.btn_center_cursor),
+                        active = false,
+                        enabled = isDesktopReady,
+                        onClick = onCenterCursor
                     )
-                    if (!oledSaverMode) {
-                        SmallControlChip(
-                            label = stringResource(R.string.btn_settings),
-                            active = showOptions,
-                            oledSaver = false,
-                            onClick = onToggleOptions
-                        )
-                    }
+                    SmallControlChip(
+                        label = stringResource(R.string.btn_settings),
+                        active = showOptions,
+                        enabled = true,
+                        onClick = onToggleOptions
+                    )
                 }
             }
 
@@ -335,7 +376,7 @@ private fun StatusHeaderCard(
                 ) {
                     Text(
                         text = stringResource(R.string.enable_service_btn),
-                        color = Color(0xFF11111B),
+                        color = Color(0xFF09090E),
                         fontWeight = FontWeight.SemiBold
                     )
                 }
@@ -348,29 +389,35 @@ private fun StatusHeaderCard(
 private fun SmallControlChip(
     label: String,
     active: Boolean,
-    oledSaver: Boolean,
+    enabled: Boolean,
     onClick: () -> Unit
 ) {
     OutlinedButton(
         onClick = onClick,
+        enabled = enabled,
         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
         modifier = Modifier.height(32.dp),
         border = BorderStroke(
             1.dp,
             when {
                 active -> Color(0xFF89B4FA)
-                oledSaver -> Color(0xFF313244)
-                else -> Color(0xFF45475A)
+                enabled -> Color(0xFF313244)
+                else -> Color(0xFF1E1E2E)
             }
         ),
         colors = ButtonDefaults.outlinedButtonColors(
-            containerColor = if (active) Color(0x3389B4FA) else Color.Transparent
+            containerColor = if (active) Color(0x2689B4FA) else Color.Transparent,
+            disabledContainerColor = Color.Transparent
         )
     ) {
         Text(
             text = label,
             fontSize = 11.sp,
-            color = if (oledSaver) Color(0xFF7F849C) else Color(0xFFCDD6F4)
+            color = when {
+                active -> Color(0xFF89B4FA)
+                enabled -> Color(0xFF7F849C)
+                else -> Color(0xFF45475A)
+            }
         )
     }
 }
@@ -378,13 +425,18 @@ private fun SmallControlChip(
 @Composable
 private fun TouchpadOptionsPanel(
     sensitivity: Float,
+    doubleTapIntervalMs: Long,
     naturalScrolling: Boolean,
+    threeFingerGesturesEnabled: Boolean,
     onSensitivityChange: (Float) -> Unit,
-    onNaturalScrollingChange: (Boolean) -> Unit
+    onDoubleTapIntervalChange: (Long) -> Unit,
+    onNaturalScrollingChange: (Boolean) -> Unit,
+    onThreeFingerGesturesChange: (Boolean) -> Unit
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E2E))
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF09090E)),
+        border = BorderStroke(1.dp, Color(0xFF1E1E2E))
     ) {
         Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
             Row(
@@ -394,7 +446,7 @@ private fun TouchpadOptionsPanel(
             ) {
                 Text(
                     text = stringResource(R.string.label_sensitivity),
-                    color = Color(0xFFCDD6F4),
+                    color = Color(0xFF9399B2),
                     fontSize = 13.sp
                 )
                 Text(
@@ -404,17 +456,54 @@ private fun TouchpadOptionsPanel(
                     fontWeight = FontWeight.SemiBold
                 )
             }
-            val sliderState = rememberSliderState(
+            val sensitivitySliderState = rememberSliderState(
                 value = sensitivity,
                 trackRange = 0.6f..3.5f
             )
             Slider(
-                state = sliderState,
+                state = sensitivitySliderState,
                 onValueChange = { value ->
-                    sliderState.value = value
+                    sensitivitySliderState.value = value
                     onSensitivityChange(value)
                 }
             )
+
+            Spacer(modifier = Modifier.height(2.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = stringResource(R.string.label_double_tap_interval),
+                    color = Color(0xFF9399B2),
+                    fontSize = 13.sp
+                )
+                Text(
+                    text = "$doubleTapIntervalMs ms",
+                    color = Color(0xFF89B4FA),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            val doubleTapSliderState = rememberSliderState(
+                value = doubleTapIntervalMs.toFloat(),
+                trackRange = GestureController.MIN_DOUBLE_TAP_INTERVAL_MS.toFloat()..
+                    GestureController.MAX_DOUBLE_TAP_INTERVAL_MS.toFloat()
+            )
+            Slider(
+                state = doubleTapSliderState,
+                onValueChange = { rawValue ->
+                    doubleTapSliderState.value = rawValue
+                    val steppedMs = ((rawValue / 10f).roundToLong() * 10L).coerceIn(
+                        GestureController.MIN_DOUBLE_TAP_INTERVAL_MS,
+                        GestureController.MAX_DOUBLE_TAP_INTERVAL_MS
+                    )
+                    onDoubleTapIntervalChange(steppedMs)
+                }
+            )
+
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -422,12 +511,28 @@ private fun TouchpadOptionsPanel(
             ) {
                 Text(
                     text = stringResource(R.string.label_natural_scroll),
-                    color = Color(0xFFCDD6F4),
+                    color = Color(0xFF9399B2),
                     fontSize = 13.sp
                 )
                 Switch(
                     checked = naturalScrolling,
                     onCheckedChange = onNaturalScrollingChange
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = stringResource(R.string.label_three_finger_gestures),
+                    color = Color(0xFF9399B2),
+                    fontSize = 13.sp
+                )
+                Switch(
+                    checked = threeFingerGesturesEnabled,
+                    onCheckedChange = onThreeFingerGesturesChange
                 )
             }
         }
@@ -440,34 +545,28 @@ private fun DeXTouchpadSurface(
     gestureController: GestureController,
     isDesktopReady: Boolean,
     isDragging: Boolean,
-    oledSaverMode: Boolean,
+    threeFingerGesturesEnabled: Boolean,
     compactHint: Boolean
 ) {
     val haptic = LocalHapticFeedback.current
     val view = LocalView.current
 
-    val surfaceColor = when {
-        oledSaverMode -> Color.Black
-        isDragging -> Color(0xFF23273B)
-        else -> Color(0xFF1E1E2E)
-    }
     val borderColor = when {
         isDragging -> Color(0xFF89B4FA)
-        oledSaverMode -> Color(0xFF181825)
-        isDesktopReady -> Color(0xFF313244)
-        else -> Color(0xFF45475A)
+        isDesktopReady -> Color(0xFF181825)
+        else -> Color(0xFF313244)
     }
 
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(22.dp))
-            .background(surfaceColor)
+            .background(Color.Black)
             .border(1.5.dp, borderColor, RoundedCornerShape(22.dp))
             .pointerInput(gestureController) {
                 val tapSlopPx = 8.dp.toPx()
                 val scrollSlopPx = 4.dp.toPx()
+                val threeFingerSwipeThresholdPx = 44.dp.toPx()
                 val tapTimeoutMs = 230L
-                val doubleTapWindowMs = 300L
                 val longPressDragMs = 420L
 
                 var lastSingleTapUpTime = 0L
@@ -481,12 +580,16 @@ private fun DeXTouchpadSurface(
                     var maxPointerCount = 1
                     var totalSingleFingerDistance = 0f
                     var totalTwoFingerDistance = 0f
+                    var totalThreeFingerDistance = 0f
                     var isMovingCursor = false
                     var isTapDragActive = false
+                    var threeFingerSwipeTriggered = false
 
+                    val doubleTapWindowMs = gestureController.doubleTapIntervalMs
                     val isQuickSecondTouch = (downTime - lastSingleTapUpTime) in 1L..doubleTapWindowMs
 
                     var previousCentroid: Offset? = null
+                    var threeFingerStartCentroid: Offset? = null
 
                     while (true) {
                         val event = awaitPointerEvent(PointerEventPass.Main)
@@ -553,12 +656,38 @@ private fun DeXTouchpadSurface(
                             )
 
                             val prev = previousCentroid
-                            if (prev != null && pointerCount == 2) {
+                            if (pointerCount == 2 && maxPointerCount == 2 && prev != null) {
                                 val scrollDelta = currentCentroid - prev
                                 val stepScroll = hypot(scrollDelta.x, scrollDelta.y)
                                 totalTwoFingerDistance += stepScroll
                                 if (totalTwoFingerDistance > scrollSlopPx && stepScroll > 0f) {
                                     gestureController.onTwoFingerScroll(scrollDelta.x, scrollDelta.y)
+                                }
+                            } else if (pointerCount == 3 && maxPointerCount == 3) {
+                                val start3 = threeFingerStartCentroid
+                                if (start3 == null) {
+                                    threeFingerStartCentroid = currentCentroid
+                                } else {
+                                    if (prev != null) {
+                                        val step3 = currentCentroid - prev
+                                        totalThreeFingerDistance += hypot(step3.x, step3.y)
+                                    }
+                                    val totalDelta = currentCentroid - start3
+                                    if (!threeFingerSwipeTriggered &&
+                                        abs(totalDelta.y) >= threeFingerSwipeThresholdPx &&
+                                        abs(totalDelta.y) > abs(totalDelta.x) * 1.2f
+                                    ) {
+                                        threeFingerSwipeTriggered = true
+                                        lastSingleTapUpTime = 0L
+                                        val handled = if (totalDelta.y > 0f) {
+                                            gestureController.onThreeFingerSwipeDown()
+                                        } else {
+                                            gestureController.onThreeFingerSwipeUp()
+                                        }
+                                        if (handled) {
+                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        }
+                                    }
                                 }
                             }
                             previousCentroid = currentCentroid
@@ -571,7 +700,7 @@ private fun DeXTouchpadSurface(
 
                     if (isTapDragActive) {
                         gestureController.onDragEnd()
-                    } else {
+                    } else if (!threeFingerSwipeTriggered) {
                         when {
                             maxPointerCount == 1 &&
                                 totalSingleFingerDistance <= tapSlopPx &&
@@ -579,7 +708,7 @@ private fun DeXTouchpadSurface(
                                 if (gestureController.onTap()) {
                                     view.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
                                 }
-                                lastSingleTapUpTime = lastEventTime
+                                lastSingleTapUpTime = if (isQuickSecondTouch) 0L else lastEventTime
                             }
 
                             maxPointerCount == 2 &&
@@ -592,6 +721,7 @@ private fun DeXTouchpadSurface(
                             }
 
                             maxPointerCount == 3 &&
+                                totalThreeFingerDistance <= tapSlopPx * 2.0f &&
                                 gestureDuration <= tapTimeoutMs + 80L -> {
                                 if (gestureController.onThreeFingerTap()) {
                                     view.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
@@ -612,30 +742,27 @@ private fun DeXTouchpadSurface(
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier.padding(horizontal = 24.dp)
         ) {
-            if (oledSaverMode) {
+            Text(
+                text = stringResource(R.string.touchpad_title),
+                color = Color(0xFF45475A),
+                fontSize = if (compactHint) 12.sp else 14.sp,
+                fontWeight = FontWeight.Medium
+            )
+            if (!compactHint) {
+                Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    text = stringResource(R.string.touchpad_oled_hint),
+                    text = stringResource(
+                        if (threeFingerGesturesEnabled) {
+                            R.string.touchpad_hint
+                        } else {
+                            R.string.touchpad_hint_no_three_finger
+                        }
+                    ),
                     color = Color(0xFF313244),
-                    fontSize = 12.sp,
+                    fontSize = 11.sp,
+                    lineHeight = 16.sp,
                     textAlign = TextAlign.Center
                 )
-            } else {
-                Text(
-                    text = stringResource(R.string.touchpad_title),
-                    color = Color(0xFF6C7086),
-                    fontSize = if (compactHint) 13.sp else 16.sp,
-                    fontWeight = FontWeight.Medium
-                )
-                if (!compactHint) {
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = stringResource(R.string.touchpad_hint),
-                        color = Color(0xFF585B70),
-                        fontSize = 12.sp,
-                        lineHeight = 18.sp,
-                        textAlign = TextAlign.Center
-                    )
-                }
             }
         }
     }
@@ -644,23 +771,19 @@ private fun DeXTouchpadSurface(
 @Composable
 private fun TrackpadButtonBar(
     enabled: Boolean,
-    oledSaverMode: Boolean,
     isDragging: Boolean,
     isKeyboardOpen: Boolean,
-    gestureController: GestureController
+    gestureController: GestureController,
+    onPreparePhoneFocusForKeyboard: () -> Unit
 ) {
     val haptic = LocalHapticFeedback.current
     val view = LocalView.current
 
-    val buttonBg = if (oledSaverMode) Color(0xFF09090E) else Color(0xFF1E1E2E)
-    val buttonBorder = if (oledSaverMode) Color(0xFF1E1E2E) else Color(0xFF313244)
-    val textColor = when {
-        !enabled -> Color(0xFF45475A)
-        oledSaverMode -> Color(0xFF6C7086)
-        else -> Color(0xFFCDD6F4)
-    }
+    val buttonBg = Color(0xFF09090E)
+    val buttonBorder = Color(0xFF1E1E2E)
+    val textColor = if (enabled) Color(0xFF6C7086) else Color(0xFF313244)
 
-    val keyboardBg = if (enabled && isKeyboardOpen) Color(0x3389B4FA) else buttonBg
+    val keyboardBg = if (enabled && isKeyboardOpen) Color(0x2689B4FA) else buttonBg
     val keyboardBorder = if (enabled && isKeyboardOpen) Color(0xFF89B4FA) else buttonBorder
     val keyboardTextColor = if (enabled && isKeyboardOpen) Color(0xFF89B4FA) else textColor
 
@@ -672,10 +795,10 @@ private fun TrackpadButtonBar(
     ) {
         Box(
             modifier = Modifier
-                .weight(1.35f)
+                .weight(1.22f)
                 .fillMaxSize()
                 .clip(RoundedCornerShape(14.dp))
-                .background(if (isDragging) Color(0x3389B4FA) else buttonBg)
+                .background(if (isDragging) Color(0x2689B4FA) else buttonBg)
                 .border(
                     1.dp,
                     if (isDragging) Color(0xFF89B4FA) else buttonBorder,
@@ -725,7 +848,7 @@ private fun TrackpadButtonBar(
         }
 
         TrackpadActionButton(
-            modifier = Modifier.weight(0.9f),
+            modifier = Modifier.weight(1.08f),
             label = stringResource(R.string.btn_right_click),
             enabled = enabled,
             backgroundColor = buttonBg,
@@ -739,7 +862,7 @@ private fun TrackpadButtonBar(
         )
 
         TrackpadActionButton(
-            modifier = Modifier.weight(1.0f),
+            modifier = Modifier.weight(0.96f),
             label = stringResource(R.string.btn_keyboard),
             enabled = enabled,
             backgroundColor = keyboardBg,
@@ -749,14 +872,17 @@ private fun TrackpadButtonBar(
                 if (isKeyboardOpen) {
                     gestureController.onDismissKeyboard()
                     view.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
-                } else if (gestureController.onRequestKeyboard()) {
-                    view.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
+                } else {
+                    onPreparePhoneFocusForKeyboard()
+                    if (gestureController.onRequestKeyboard()) {
+                        view.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
+                    }
                 }
             }
         )
 
         TrackpadActionButton(
-            modifier = Modifier.weight(0.75f),
+            modifier = Modifier.weight(0.72f),
             label = stringResource(R.string.btn_back),
             enabled = enabled,
             backgroundColor = buttonBg,
@@ -770,7 +896,7 @@ private fun TrackpadButtonBar(
         )
 
         TrackpadActionButton(
-            modifier = Modifier.weight(0.75f),
+            modifier = Modifier.weight(0.72f),
             label = stringResource(R.string.btn_home),
             enabled = enabled,
             backgroundColor = buttonBg,

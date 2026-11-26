@@ -12,6 +12,7 @@ import android.view.Display
 import android.view.Gravity
 import android.view.WindowManager
 import android.widget.ImageView
+import androidx.annotation.DrawableRes
 import com.example.desktoptouchpad.R
 import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -24,6 +25,29 @@ data class ExternalDisplayInfo(
     val width: Int,
     val height: Int
 )
+
+enum class CursorStyle(
+    @DrawableRes val drawableRes: Int,
+    val hotspotXFraction: Float,
+    val hotspotYFraction: Float,
+) {
+    ARROW(R.drawable.ic_cursor, 4.5f / 24f, 3.5f / 24f),
+    HAND(R.drawable.ic_cursor_hand, 9.5f / 24f, 2.5f / 24f),
+    TEXT(R.drawable.ic_cursor_text, 12f / 24f, 11f / 24f),
+    GRABBING(R.drawable.ic_cursor_grabbing, 8.5f / 24f, 7.5f / 24f),
+    ALL_SCROLL(R.drawable.ic_cursor_all_scroll, 12f / 24f, 12f / 24f),
+    CONTEXT_MENU(R.drawable.ic_cursor_context_menu, 4.5f / 24f, 3.5f / 24f),
+    RESIZE_HORIZONTAL(R.drawable.ic_cursor_resize_horizontal, 12f / 24f, 12f / 24f),
+    RESIZE_VERTICAL(R.drawable.ic_cursor_resize_vertical, 12f / 24f, 12f / 24f),
+    RESIZE_DIAG_NW_SE(R.drawable.ic_cursor_resize_diag_nw_se, 12f / 24f, 12f / 24f),
+    RESIZE_DIAG_NE_SW(R.drawable.ic_cursor_resize_diag_ne_sw, 12f / 24f, 12f / 24f);
+
+    val isResizeCursor: Boolean
+        get() = this == RESIZE_HORIZONTAL ||
+            this == RESIZE_VERTICAL ||
+            this == RESIZE_DIAG_NW_SE ||
+            this == RESIZE_DIAG_NE_SW
+}
 
 class CursorOverlayManager(private val service: AccessibilityService) {
 
@@ -39,7 +63,26 @@ class CursorOverlayManager(private val service: AccessibilityService) {
     private var cursorY = 0f
     private var displayWidth = 1920
     private var displayHeight = 1080
-    private var hotspotOffsetPx = 2
+    private var cursorSizePx = 28
+    private var hotspotOffsetXPx = 5
+    private var hotspotOffsetYPx = 4
+
+    private var appliedStyle: CursorStyle = CursorStyle.ARROW
+    private var hoverStyle: CursorStyle = CursorStyle.ARROW
+    private var dragResizeStyle: CursorStyle? = null
+    private var isDraggingActive = false
+    private var isScrollingActive = false
+    private var isContextClickActive = false
+
+    private val clearScrollVisualRunnable = Runnable {
+        isScrollingActive = false
+        refreshEffectiveCursorStyle()
+    }
+
+    private val clearContextVisualRunnable = Runnable {
+        isContextClickActive = false
+        refreshEffectiveCursorStyle()
+    }
 
     var activeDisplayId: Int = Display.INVALID_DISPLAY
         private set
@@ -121,11 +164,17 @@ class CursorOverlayManager(private val service: AccessibilityService) {
         cursorY = height / 2f
 
         val density = overlayContext.resources.displayMetrics.density.coerceAtLeast(1f)
-        val cursorSizePx = (28f * density).roundToInt().coerceAtLeast(28)
-        hotspotOffsetPx = (cursorSizePx * (1.5f / 24f)).roundToInt()
+        cursorSizePx = (28f * density).roundToInt().coerceAtLeast(28)
+        appliedStyle = CursorStyle.ARROW
+        hoverStyle = CursorStyle.ARROW
+        dragResizeStyle = null
+        isDraggingActive = false
+        isScrollingActive = false
+        isContextClickActive = false
+        updateHotspotOffsetsForStyle(appliedStyle)
 
         val imageView = ImageView(overlayContext).apply {
-            setImageResource(R.drawable.ic_cursor)
+            setImageResource(appliedStyle.drawableRes)
             scaleType = ImageView.ScaleType.FIT_XY
         }
 
@@ -145,6 +194,11 @@ class CursorOverlayManager(private val service: AccessibilityService) {
         }
     }
 
+    private fun updateHotspotOffsetsForStyle(style: CursorStyle) {
+        hotspotOffsetXPx = (cursorSizePx * style.hotspotXFraction).roundToInt()
+        hotspotOffsetYPx = (cursorSizePx * style.hotspotYFraction).roundToInt()
+    }
+
     private fun createOverlayContext(display: Display): Context {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             service.createWindowContext(
@@ -157,10 +211,10 @@ class CursorOverlayManager(private val service: AccessibilityService) {
         }
     }
 
-    private fun createOverlayLayoutParams(cursorSizePx: Int): WindowManager.LayoutParams {
+    private fun createOverlayLayoutParams(sizePx: Int): WindowManager.LayoutParams {
         return WindowManager.LayoutParams(
-            cursorSizePx,
-            cursorSizePx,
+            sizePx,
+            sizePx,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
@@ -169,8 +223,8 @@ class CursorOverlayManager(private val service: AccessibilityService) {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = cursorX.roundToInt() - hotspotOffsetPx
-            y = cursorY.roundToInt() - hotspotOffsetPx
+            x = cursorX.roundToInt() - hotspotOffsetXPx
+            y = cursorY.roundToInt() - hotspotOffsetYPx
         }
     }
 
@@ -190,17 +244,17 @@ class CursorOverlayManager(private val service: AccessibilityService) {
         }
     }
 
-    private fun tryFallbackDisplayContext(display: Display, cursorSizePx: Int): Boolean {
+    private fun tryFallbackDisplayContext(display: Display, sizePx: Int): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
         return try {
             val fallbackContext = service.createDisplayContext(display)
             val fallbackWm =
                 fallbackContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
             val fallbackView = ImageView(fallbackContext).apply {
-                setImageResource(R.drawable.ic_cursor)
+                setImageResource(appliedStyle.drawableRes)
                 scaleType = ImageView.ScaleType.FIT_XY
             }
-            val fallbackParams = createOverlayLayoutParams(cursorSizePx)
+            val fallbackParams = createOverlayLayoutParams(sizePx)
             fallbackWm.addView(fallbackView, fallbackParams)
             windowManager = fallbackWm
             cursorView = fallbackView
@@ -263,19 +317,61 @@ class CursorOverlayManager(private val service: AccessibilityService) {
         applyCursorLayout()
     }
 
+    fun setHoverCursorStyle(style: CursorStyle) {
+        if (hoverStyle == style) return
+        hoverStyle = style
+        refreshEffectiveCursorStyle()
+    }
+
     fun setDraggingVisual(isDragging: Boolean) {
-        cursorView?.apply {
-            scaleX = if (isDragging) 0.9f else 1.0f
-            scaleY = if (isDragging) 0.9f else 1.0f
-            alpha = if (isDragging) 0.85f else 1.0f
+        if (isDraggingActive == isDragging) return
+        isDraggingActive = isDragging
+        dragResizeStyle = if (isDragging && hoverStyle.isResizeCursor) {
+            hoverStyle
+        } else {
+            null
         }
+        refreshEffectiveCursorStyle()
+    }
+
+    fun notifyScrollingVisual() {
+        mainHandler.removeCallbacks(clearScrollVisualRunnable)
+        if (!isScrollingActive) {
+            isScrollingActive = true
+            refreshEffectiveCursorStyle()
+        }
+        mainHandler.postDelayed(clearScrollVisualRunnable, 220L)
+    }
+
+    fun notifyContextClickVisual() {
+        mainHandler.removeCallbacks(clearContextVisualRunnable)
+        if (!isContextClickActive) {
+            isContextClickActive = true
+            refreshEffectiveCursorStyle()
+        }
+        mainHandler.postDelayed(clearContextVisualRunnable, 320L)
+    }
+
+    private fun refreshEffectiveCursorStyle() {
+        if (activeDisplayId == Display.INVALID_DISPLAY) return
+        val desired = when {
+            isDraggingActive -> dragResizeStyle ?: CursorStyle.GRABBING
+            isContextClickActive -> CursorStyle.CONTEXT_MENU
+            isScrollingActive -> CursorStyle.ALL_SCROLL
+            else -> hoverStyle
+        }
+        if (desired == appliedStyle) return
+        appliedStyle = desired
+        updateHotspotOffsetsForStyle(desired)
+        cursorView?.setImageResource(desired.drawableRes)
+        applyCursorLayout()
     }
 
     private fun applyCursorLayout() {
         val view = cursorView ?: return
         val layoutParams = params ?: return
-        layoutParams.x = cursorX.roundToInt() - hotspotOffsetPx
-        layoutParams.y = cursorY.roundToInt() - hotspotOffsetPx
+        layoutParams.x = cursorX.roundToInt() - hotspotOffsetXPx
+        layoutParams.y = cursorY.roundToInt() - hotspotOffsetYPx
         try {
             windowManager?.updateViewLayout(view, layoutParams)
         } catch (_: Exception) {
@@ -288,6 +384,8 @@ class CursorOverlayManager(private val service: AccessibilityService) {
     fun getDisplayDimensions(): Pair<Int, Int> = Pair(displayWidth, displayHeight)
 
     private fun detachOverlay() {
+        mainHandler.removeCallbacks(clearScrollVisualRunnable)
+        mainHandler.removeCallbacks(clearContextVisualRunnable)
         cursorView?.let { view ->
             try {
                 windowManager?.removeView(view)
@@ -298,6 +396,12 @@ class CursorOverlayManager(private val service: AccessibilityService) {
         cursorView = null
         params = null
         windowManager = null
+        isDraggingActive = false
+        isScrollingActive = false
+        isContextClickActive = false
+        dragResizeStyle = null
+        hoverStyle = CursorStyle.ARROW
+        appliedStyle = CursorStyle.ARROW
         activeDisplayId = Display.INVALID_DISPLAY
         _displayInfo.value = null
     }
