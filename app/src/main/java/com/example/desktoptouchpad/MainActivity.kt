@@ -14,6 +14,7 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
 import android.view.Display
+import android.view.MotionEvent
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import androidx.activity.ComponentActivity
@@ -104,7 +105,9 @@ class MainActivity : ComponentActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var displayManager: DisplayManager
 
-    private var desiredWindowFocusable: Boolean = true
+    private var canSuppressFocusOnInput: Boolean = false
+    private var isTouchDown: Boolean = false
+    private var isInputActivityActive: Boolean = false
     private var appliedWindowFocusable: Boolean = true
     private var desiredKeepScreenOn: Boolean = false
     private var isActivityStarted: Boolean = false
@@ -112,6 +115,16 @@ class MainActivity : ComponentActivity() {
     private var isUnplugConfirmationPending: Boolean = false
     private var isExitingFromUnplug: Boolean = false
     private var isScreenOffReceiverRegistered: Boolean = false
+
+    private val clearInputActivityRunnable: Runnable = Runnable {
+        if (isDestroyed || isFinishing) return@Runnable
+        if (isTouchDown || TouchpadAccessibilityService.isDragging.value) {
+            mainHandler.postDelayed(clearInputActivityRunnable, INPUT_IDLE_CLEAR_DELAY_MS)
+            return@Runnable
+        }
+        isInputActivityActive = false
+        syncWindowFlagsIfInteractive()
+    }
 
     private val armUnplugExitRunnable = Runnable {
         if (!isDestroyed && !isFinishing &&
@@ -211,6 +224,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         mainHandler.removeCallbacks(armUnplugExitRunnable)
         mainHandler.removeCallbacks(confirmUnplugExitRunnable)
+        mainHandler.removeCallbacks(clearInputActivityRunnable)
         if (::displayManager.isInitialized) {
             runCatching { displayManager.unregisterDisplayListener(displayListener) }
         }
@@ -223,6 +237,41 @@ class MainActivity : ComponentActivity() {
         }
         restoreNormalPhoneWindowFlags()
         super.onDestroy()
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent?): Boolean {
+        when (ev?.actionMasked) {
+            MotionEvent.ACTION_DOWN,
+            MotionEvent.ACTION_POINTER_DOWN,
+            MotionEvent.ACTION_MOVE,
+            -> {
+                isTouchDown = true
+                onActiveInputDetected()
+            }
+            MotionEvent.ACTION_UP,
+            MotionEvent.ACTION_CANCEL,
+            -> {
+                isTouchDown = false
+                scheduleClearInputActivityIfNeeded()
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    override fun dispatchGenericMotionEvent(ev: MotionEvent?): Boolean {
+        when (ev?.actionMasked) {
+            MotionEvent.ACTION_SCROLL,
+            MotionEvent.ACTION_BUTTON_PRESS,
+            MotionEvent.ACTION_BUTTON_RELEASE,
+            MotionEvent.ACTION_HOVER_MOVE,
+            -> {
+                onActiveInputDetected()
+                if (!isTouchDown) {
+                    scheduleClearInputActivityIfNeeded()
+                }
+            }
+        }
+        return super.dispatchGenericMotionEvent(ev)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -258,8 +307,14 @@ class MainActivity : ComponentActivity() {
                         desiredKeepScreenOn = keepOn
                         applyKeepScreenOn(keepOn)
                     },
-                    onSetWindowFocusable = { focusable ->
-                        desiredWindowFocusable = focusable
+                    onSetAllowNonFocusableOnInput = { allowed ->
+                        canSuppressFocusOnInput = allowed
+                        if (!allowed) {
+                            clearInputActivityState()
+                        } else if (isTouchDown) {
+                            mainHandler.removeCallbacks(clearInputActivityRunnable)
+                            isInputActivityActive = true
+                        }
                         if (isActivityStarted) {
                             syncWindowFlagsIfInteractive()
                         }
@@ -303,6 +358,27 @@ class MainActivity : ComponentActivity() {
         mainHandler.postDelayed(confirmUnplugExitRunnable, UNPLUG_CONFIRM_DELAY_MS)
     }
 
+    private fun onActiveInputDetected() {
+        if (!canSuppressFocusOnInput) return
+        mainHandler.removeCallbacks(clearInputActivityRunnable)
+        if (!isInputActivityActive) {
+            isInputActivityActive = true
+            syncWindowFlagsIfInteractive()
+        }
+    }
+
+    private fun scheduleClearInputActivityIfNeeded() {
+        if (!isInputActivityActive) return
+        mainHandler.removeCallbacks(clearInputActivityRunnable)
+        mainHandler.postDelayed(clearInputActivityRunnable, INPUT_IDLE_CLEAR_DELAY_MS)
+    }
+
+    private fun clearInputActivityState() {
+        isTouchDown = false
+        isInputActivityActive = false
+        mainHandler.removeCallbacks(clearInputActivityRunnable)
+    }
+
     private fun applyWindowFocusable(focusable: Boolean) {
         if (isExitingFromUnplug && !focusable) return
         if (appliedWindowFocusable != focusable) {
@@ -325,6 +401,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun restoreNormalPhoneWindowFlags() {
+        clearInputActivityState()
         appliedWindowFocusable = true
         window.clearFlags(
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
@@ -345,7 +422,8 @@ class MainActivity : ComponentActivity() {
             restoreNormalPhoneWindowFlags()
             return
         }
-        applyWindowFocusable(desiredWindowFocusable)
+        val shouldWindowBeFocusable = !(canSuppressFocusOnInput && isInputActivityActive)
+        applyWindowFocusable(shouldWindowBeFocusable)
         applyKeepScreenOn(desiredKeepScreenOn)
     }
 
@@ -395,6 +473,9 @@ class MainActivity : ComponentActivity() {
 
         /** Debounce window to ignore transient Mirror -> Desktop display swaps while connected. */
         private const val UNPLUG_CONFIRM_DELAY_MS = 650L
+
+        /** Idle timeout after input ends before clearing FLAG_NOT_FOCUSABLE again. */
+        private const val INPUT_IDLE_CLEAR_DELAY_MS = 600L
     }
 }
 
@@ -403,7 +484,7 @@ fun TouchpadScreen(
     gestureController: GestureController,
     onExternalDisplayConnected: () -> Unit,
     onSetKeepScreenOn: (Boolean) -> Unit,
-    onSetWindowFocusable: (Boolean) -> Unit,
+    onSetAllowNonFocusableOnInput: (Boolean) -> Unit,
     onOpenSettings: () -> Unit
 ) {
     val isServiceActive by TouchpadAccessibilityService.isConnected.collectAsState()
@@ -430,17 +511,17 @@ fun TouchpadScreen(
     val activeTextSession = textSession
     val isKeyboardRelayVisible = isDesktopReady && activeTextSession != null
 
-    // Keep WindowManager's top display focus on the external display while acting as a touchpad,
-    // and only make the phone window focusable when Gboard relay or a dialog needs focus.
-    val shouldPhoneWindowBeFocusable = !isDesktopReady || isKeyboardRelayVisible || showDisclosure
+    // Keep FLAG_NOT_FOCUSABLE cleared when idle, and only allow setting it during active touchpad
+    // input when Desktop Mode is ready and neither Gboard relay nor a dialog needs phone focus.
+    val allowNonFocusableOnInput = isDesktopReady && !isKeyboardRelayVisible && !showDisclosure
 
     SideEffect {
-        onSetWindowFocusable(shouldPhoneWindowBeFocusable)
+        onSetAllowNonFocusableOnInput(allowNonFocusableOnInput)
     }
 
     DisposableEffect(Unit) {
         onDispose {
-            onSetWindowFocusable(true)
+            onSetAllowNonFocusableOnInput(false)
         }
     }
 
@@ -535,7 +616,7 @@ fun TouchpadScreen(
                         isKeyboardOpen = isKeyboardRelayVisible,
                         gestureController = gestureController,
                         onPreparePhoneFocusForKeyboard = {
-                            onSetWindowFocusable(true)
+                            onSetAllowNonFocusableOnInput(false)
                         }
                     )
                 }
