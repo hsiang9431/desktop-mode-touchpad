@@ -10,6 +10,7 @@ import android.os.Looper
 import android.util.DisplayMetrics
 import android.view.Display
 import android.view.Gravity
+import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.widget.ImageView
 import androidx.annotation.DrawableRes
@@ -69,6 +70,8 @@ class CursorOverlayManager(
     private var cursorSizePx = 28
     private var hotspotOffsetXPx = 5
     private var hotspotOffsetYPx = 4
+    private var minScalingSpanPx = 170f
+    private var touchSlopPx = 16f
 
     private var appliedStyle: CursorStyle = CursorStyle.ARROW
     private var hoverStyle: CursorStyle = CursorStyle.ARROW
@@ -76,11 +79,6 @@ class CursorOverlayManager(
     private var isDraggingActive = false
     private var isScrollingActive = false
     private var isContextClickActive = false
-
-    private val clearScrollVisualRunnable = Runnable {
-        isScrollingActive = false
-        refreshEffectiveCursorStyle()
-    }
 
     private val clearContextVisualRunnable = Runnable {
         isContextClickActive = false
@@ -166,6 +164,13 @@ class CursorOverlayManager(
         cursorY = height / 2f
 
         val density = overlayContext.resources.displayMetrics.density.coerceAtLeast(1f)
+        val viewConfig = ViewConfiguration.get(overlayContext)
+        minScalingSpanPx = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            viewConfig.scaledMinimumScalingSpan.toFloat().coerceAtLeast(48f)
+        } else {
+            170f * density
+        }
+        touchSlopPx = viewConfig.scaledTouchSlop.toFloat().coerceAtLeast(8f)
         cursorSizePx = (28f * density).roundToInt().coerceAtLeast(28)
         appliedStyle = CursorStyle.ARROW
         hoverStyle = CursorStyle.ARROW
@@ -345,13 +350,10 @@ class CursorOverlayManager(
         refreshEffectiveCursorStyle()
     }
 
-    fun notifyScrollingVisual() {
-        mainHandler.removeCallbacks(clearScrollVisualRunnable)
-        if (!isScrollingActive) {
-            isScrollingActive = true
-            refreshEffectiveCursorStyle()
-        }
-        mainHandler.postDelayed(clearScrollVisualRunnable, 220L)
+    fun setScrollingVisual(isScrolling: Boolean) {
+        if (isScrollingActive == isScrolling) return
+        isScrollingActive = isScrolling
+        refreshEffectiveCursorStyle()
     }
 
     fun notifyContextClickVisual() {
@@ -394,8 +396,11 @@ class CursorOverlayManager(
 
     fun getDisplayDimensions(): Pair<Int, Int> = Pair(displayWidth, displayHeight)
 
+    fun getMinScalingSpanPx(): Float = minScalingSpanPx
+
+    fun getTouchSlopPx(): Float = touchSlopPx
+
     private fun detachOverlay() {
-        mainHandler.removeCallbacks(clearScrollVisualRunnable)
         mainHandler.removeCallbacks(clearContextVisualRunnable)
         cursorView?.let { view ->
             try {

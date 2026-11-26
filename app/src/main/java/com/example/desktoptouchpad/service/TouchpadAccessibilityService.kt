@@ -27,7 +27,8 @@ import com.example.desktoptouchpad.overlay.CursorStyle
 import com.example.desktoptouchpad.overlay.ExternalDisplayInfo
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
-import kotlin.math.hypot
+import kotlin.math.min
+import kotlin.math.sqrt
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -68,9 +69,39 @@ class TouchpadAccessibilityService : AccessibilityService() {
     private var dragGeneration = 0
     private var dragRestartCount = 0
 
-    private var isScrollInFlight = false
+    private var isScrollRequested = false
+    private var activeScrollStroke: GestureDescription.StrokeDescription? = null
+    private var lastScrollX = 0f
+    private var lastScrollY = 0f
     private var pendingScrollX = 0f
     private var pendingScrollY = 0f
+    private var scrollDisplayId = Display.INVALID_DISPLAY
+    private var scrollGeneration = 0
+    private var scrollRestartCount = 0
+
+    private var isPinchRequested = false
+    private var activePinchStroke1: GestureDescription.StrokeDescription? = null
+    private var activePinchStroke2: GestureDescription.StrokeDescription? = null
+    private var pinchFocalX = 0f
+    private var pinchFocalY = 0f
+    private var currentPinchHalfSpan = 0f
+    private var minPinchHalfSpan = 90f
+    private var maxPinchHalfSpan = 420f
+    private var initialPinchHalfSpan = 180f
+    private var lastPinchP1X = 0f
+    private var lastPinchP1Y = 0f
+    private var lastPinchP2X = 0f
+    private var lastPinchP2Y = 0f
+    private var pendingPinchScale = 1f
+    private var pinchDisplayId = Display.INVALID_DISPLAY
+    private var pinchGeneration = 0
+    private var pinchRestartCount = 0
+
+    private enum class SliceEndMode {
+        CONTINUE,
+        REANCHOR,
+        FINAL_RELEASE,
+    }
 
     private var lastHoverDispatchUptimeMs = 0L
     private val isHoverInspectionRunning = AtomicBoolean(false)
@@ -161,6 +192,8 @@ class TouchpadAccessibilityService : AccessibilityService() {
     private fun cleanup() {
         mainHandler.removeCallbacks(deferredHoverCheckRunnable)
         resetDragState()
+        resetScrollState()
+        resetPinchState()
         isPhoneKeyboardAllowed = false
         externalTextBridge.clearAll()
         runCatching {
@@ -180,9 +213,8 @@ class TouchpadAccessibilityService : AccessibilityService() {
         mainHandler.removeCallbacks(deferredHoverCheckRunnable)
         isPhoneKeyboardAllowed = false
         resetDragState()
-        pendingScrollX = 0f
-        pendingScrollY = 0f
-        isScrollInFlight = false
+        resetScrollState()
+        resetPinchState()
         externalTextBridge.clearAll()
         if (::overlayManager.isInitialized && overlayManager.activeDisplayId != Display.INVALID_DISPLAY) {
             overlayManager.syncTargetDisplay()
@@ -269,7 +301,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
     fun moveCursor(deltaX: Float, deltaY: Float) {
         if (!::overlayManager.isInitialized) return
         overlayManager.updateCursorPosition(deltaX, deltaY)
-        if (!isDragRequested && activeDragStroke == null) {
+        if (!hasActiveContinuousGesture()) {
             throttledHoverInspectionOnMove()
         }
     }
@@ -285,9 +317,27 @@ class TouchpadAccessibilityService : AccessibilityService() {
         return overlayManager.getCursorCoordinates()
     }
 
+    private fun isAnotherGestureRequested(): Boolean {
+        return isDragRequested || (activeDragStroke != null) || isScrollRequested || isPinchRequested
+    }
+
+    private fun clearFinishedAuxiliaryGestures() {
+        if (!isScrollRequested && (activeScrollStroke != null)) {
+            resetScrollState()
+        }
+        if (!isPinchRequested && (activePinchStroke1 != null || activePinchStroke2 != null)) {
+            resetPinchState()
+        }
+    }
+
+    fun hasActiveContinuousGesture(): Boolean {
+        return isDragActive() || isScrollActive() || isPinchActive()
+    }
+
     fun performTap(x: Float, y: Float): Boolean {
         val displayId = activeTargetDisplayId() ?: return false
-        if (isDragRequested || (activeDragStroke != null)) return false
+        if (isAnotherGestureRequested()) return false
+        clearFinishedAuxiliaryGestures()
 
         val (clampedX, clampedY) = clampToDisplay(x, y)
         externalTextBridge.onBeforeExternalTap(displayId, clampedX, clampedY)
@@ -305,7 +355,8 @@ class TouchpadAccessibilityService : AccessibilityService() {
     }
 
     private fun performRawTap(displayId: Int, x: Float, y: Float): Boolean {
-        if (isDragRequested || (activeDragStroke != null)) return false
+        if (isAnotherGestureRequested()) return false
+        clearFinishedAuxiliaryGestures()
         if (_textSession.value == null) {
             suppressExternalSoftKeyboard()
         }
@@ -317,7 +368,8 @@ class TouchpadAccessibilityService : AccessibilityService() {
 
     fun performContextClick(x: Float, y: Float): Boolean {
         val displayId = activeTargetDisplayId() ?: return false
-        if (isDragRequested || (activeDragStroke != null)) return false
+        if (isAnotherGestureRequested()) return false
+        clearFinishedAuxiliaryGestures()
 
         if (_textSession.value == null) {
             suppressExternalSoftKeyboard()
@@ -339,6 +391,10 @@ class TouchpadAccessibilityService : AccessibilityService() {
 
     fun isDragActive(): Boolean = isDragRequested || (activeDragStroke != null)
 
+    fun isScrollActive(): Boolean = isScrollRequested || (activeScrollStroke != null)
+
+    fun isPinchActive(): Boolean = isPinchRequested || (activePinchStroke1 != null)
+
     fun startDrag(): Boolean {
         val displayId = activeTargetDisplayId() ?: return false
         if (isDragRequested) return true
@@ -346,8 +402,8 @@ class TouchpadAccessibilityService : AccessibilityService() {
         if (_textSession.value == null) {
             suppressExternalSoftKeyboard()
         }
-        pendingScrollX = 0f
-        pendingScrollY = 0f
+        resetScrollState()
+        resetPinchState()
 
         isDragRequested = true
         overlayManager.setDraggingVisual(isDragging = true)
@@ -482,83 +538,595 @@ class TouchpadAccessibilityService : AccessibilityService() {
         _isDragging.value = false
     }
 
-    fun enqueueScroll(deltaX: Float, deltaY: Float) {
-        if (isDragRequested || (activeDragStroke != null)) return
-        if (activeTargetDisplayId() == null) return
+    fun startScroll(initialDeltaX: Float = 0f, initialDeltaY: Float = 0f): Boolean {
+        val displayId = activeTargetDisplayId() ?: return false
+        if (isDragActive() || isPinchRequested) return false
+        if (activePinchStroke1 != null || activePinchStroke2 != null) {
+            resetPinchState()
+        }
 
-        overlayManager.notifyScrollingVisual()
-        pendingScrollX = (pendingScrollX + deltaX).coerceIn(-MAX_SCROLL_STEP_PX, MAX_SCROLL_STEP_PX)
-        pendingScrollY = (pendingScrollY + deltaY).coerceIn(-MAX_SCROLL_STEP_PX, MAX_SCROLL_STEP_PX)
-        flushPendingScrollIfIdle()
+        if (_textSession.value == null) {
+            suppressExternalSoftKeyboard()
+        }
+
+        pendingScrollX = (pendingScrollX + initialDeltaX)
+            .coerceIn(-MAX_PENDING_SCROLL_PX, MAX_PENDING_SCROLL_PX)
+        pendingScrollY = (pendingScrollY + initialDeltaY)
+            .coerceIn(-MAX_PENDING_SCROLL_PX, MAX_PENDING_SCROLL_PX)
+
+        isScrollRequested = true
+        overlayManager.setScrollingVisual(isScrolling = true)
+
+        if ((activeScrollStroke != null) && (scrollDisplayId == displayId)) {
+            // Re-armed before the release slice was dispatched; keep holding the existing stroke.
+            return true
+        }
+
+        scrollRestartCount = 0
+        return beginScrollStroke(displayId)
     }
 
-    private fun flushPendingScrollIfIdle() {
-        if (isScrollInFlight || isDragRequested || (activeDragStroke != null)) return
-        val displayId = activeTargetDisplayId()
-        if (displayId == null) {
-            pendingScrollX = 0f
-            pendingScrollY = 0f
-            return
+    fun enqueueScroll(deltaX: Float, deltaY: Float) {
+        if (isDragActive() || isPinchRequested) return
+        val displayId = activeTargetDisplayId() ?: return
+
+        pendingScrollX = (pendingScrollX + deltaX)
+            .coerceIn(-MAX_PENDING_SCROLL_PX, MAX_PENDING_SCROLL_PX)
+        pendingScrollY = (pendingScrollY + deltaY)
+            .coerceIn(-MAX_PENDING_SCROLL_PX, MAX_PENDING_SCROLL_PX)
+
+        if (isScrollRequested) {
+            overlayManager.setScrollingVisual(isScrolling = true)
+            if (activeScrollStroke == null) {
+                beginScrollStroke(displayId)
+            }
         }
+    }
 
-        if (hypot(pendingScrollX, pendingScrollY) < MIN_SCROLL_DISPATCH_PX) {
-            return
+    fun endScroll() {
+        if (!isScrollRequested) return
+        isScrollRequested = false
+        if (activeScrollStroke == null) {
+            resetScrollState()
         }
+        scheduleHoverInspection(delayMs = 120L)
+    }
 
-        val stepX = pendingScrollX.coerceIn(-SINGLE_SCROLL_STROKE_PX, SINGLE_SCROLL_STROKE_PX)
-        val stepY = pendingScrollY.coerceIn(-SINGLE_SCROLL_STROKE_PX, SINGLE_SCROLL_STROKE_PX)
-        pendingScrollX -= stepX
-        pendingScrollY -= stepY
-
+    private fun beginScrollStroke(displayId: Int): Boolean {
         val (width, height) = overlayManager.getDisplayDimensions()
-        val maxX = (width - 2).coerceAtLeast(2).toFloat()
-        val maxY = (height - 2).coerceAtLeast(2).toFloat()
+        val minCoord = SCROLL_EDGE_MARGIN_PX
+        val maxX = (width - SCROLL_EDGE_MARGIN_PX).coerceAtLeast(minCoord + 1f)
+        val maxY = (height - SCROLL_EDGE_MARGIN_PX).coerceAtLeast(minCoord + 1f)
         val (cursorX, cursorY) = overlayManager.getCursorCoordinates()
 
+        val desiredDx = pendingScrollX.coerceIn(-SINGLE_SCROLL_SLICE_PX, SINGLE_SCROLL_SLICE_PX)
+        val desiredDy = pendingScrollY.coerceIn(-SINGLE_SCROLL_SLICE_PX, SINGLE_SCROLL_SLICE_PX)
+
         val startX = when {
-            cursorX + stepX < 1f -> (1f - stepX).coerceIn(1f, maxX)
-            cursorX + stepX > maxX -> (maxX - stepX).coerceIn(1f, maxX)
-            else -> cursorX.coerceIn(1f, maxX)
+            cursorX + desiredDx < minCoord -> (minCoord - desiredDx + SCROLL_REANCHOR_HEADROOM_PX).coerceIn(minCoord, maxX)
+            cursorX + desiredDx > maxX -> (maxX - desiredDx - SCROLL_REANCHOR_HEADROOM_PX).coerceIn(minCoord, maxX)
+            else -> cursorX.coerceIn(minCoord, maxX)
         }
         val startY = when {
-            cursorY + stepY < 1f -> (1f - stepY).coerceIn(1f, maxY)
-            cursorY + stepY > maxY -> (maxY - stepY).coerceIn(1f, maxY)
-            else -> cursorY.coerceIn(1f, maxY)
-        }
-        val endX = (startX + stepX).coerceIn(1f, maxX)
-        val endY = (startY + stepY).coerceIn(1f, maxY)
-
-        if (hypot(endX - startX, endY - startY) < 1f) {
-            return
+            cursorY + desiredDy < minCoord -> (minCoord - desiredDy + SCROLL_REANCHOR_HEADROOM_PX).coerceIn(minCoord, maxY)
+            cursorY + desiredDy > maxY -> (maxY - desiredDy - SCROLL_REANCHOR_HEADROOM_PX).coerceIn(minCoord, maxY)
+            else -> cursorY.coerceIn(minCoord, maxY)
         }
 
-        val path = Path().apply {
+        val targetX = (startX + desiredDx).coerceIn(minCoord, maxX)
+        val targetY = (startY + desiredDy).coerceIn(minCoord, maxY)
+        pendingScrollX -= (targetX - startX)
+        pendingScrollY -= (targetY - startY)
+
+        scrollGeneration++
+        scrollDisplayId = displayId
+        lastScrollX = targetX
+        lastScrollY = targetY
+
+        val initialPath = Path().apply {
             moveTo(startX, startY)
-            lineTo(endX, endY)
+            lineTo(targetX, targetY)
         }
-        val stroke = GestureDescription.StrokeDescription(path, 0L, SCROLL_DURATION_MS)
-        isScrollInFlight = true
+        val initialStroke = GestureDescription.StrokeDescription(
+            initialPath,
+            0L,
+            SCROLL_SLICE_DURATION_MS,
+            /* willContinue = */ true,
+        )
+        activeScrollStroke = initialStroke
+        return dispatchScrollSlice(
+            displayId = displayId,
+            stroke = initialStroke,
+            endMode = SliceEndMode.CONTINUE,
+            generation = scrollGeneration,
+        )
+    }
 
+    private fun dispatchScrollSlice(
+        displayId: Int,
+        stroke: GestureDescription.StrokeDescription,
+        endMode: SliceEndMode,
+        generation: Int,
+    ): Boolean {
         val dispatched = dispatchGesture(
             createGestureBuilder(displayId).addStroke(stroke).build(),
             object : GestureResultCallback() {
                 override fun onCompleted(gestureDescription: GestureDescription?) {
-                    isScrollInFlight = false
-                    flushPendingScrollIfIdle()
+                    if (generation != scrollGeneration) return
+                    if (activeTargetDisplayId() != displayId) {
+                        resetScrollState()
+                        return
+                    }
+
+                    when (endMode) {
+                        SliceEndMode.FINAL_RELEASE -> {
+                            resetScrollState()
+                            return
+                        }
+                        SliceEndMode.REANCHOR -> {
+                            if (isScrollRequested) {
+                                activeScrollStroke = null
+                                beginScrollStroke(displayId)
+                            } else {
+                                resetScrollState()
+                            }
+                            return
+                        }
+                        SliceEndMode.CONTINUE -> {
+                            if (activeScrollStroke == null) {
+                                resetScrollState()
+                                return
+                            }
+                        }
+                    }
+
+                    scrollRestartCount = 0
+                    val (width, height) = overlayManager.getDisplayDimensions()
+                    val minCoord = SCROLL_EDGE_MARGIN_PX
+                    val maxX = (width - SCROLL_EDGE_MARGIN_PX).coerceAtLeast(minCoord + 1f)
+                    val maxY = (height - SCROLL_EDGE_MARGIN_PX).coerceAtLeast(minCoord + 1f)
+
+                    val desiredDx = pendingScrollX.coerceIn(-SINGLE_SCROLL_SLICE_PX, SINGLE_SCROLL_SLICE_PX)
+                    val desiredDy = pendingScrollY.coerceIn(-SINGLE_SCROLL_SLICE_PX, SINGLE_SCROLL_SLICE_PX)
+                    val targetX = (lastScrollX + desiredDx).coerceIn(minCoord, maxX)
+                    val targetY = (lastScrollY + desiredDy).coerceIn(minCoord, maxY)
+                    val actualDx = targetX - lastScrollX
+                    val actualDy = targetY - lastScrollY
+
+                    pendingScrollX -= actualDx
+                    pendingScrollY -= actualDy
+
+                    val blockedByEdge = (abs(desiredDx - actualDx) > 2f) ||
+                        (abs(desiredDy - actualDy) > 2f)
+
+                    val nextEndMode = when {
+                        !isScrollRequested -> {
+                            pendingScrollX = 0f
+                            pendingScrollY = 0f
+                            SliceEndMode.FINAL_RELEASE
+                        }
+                        blockedByEdge -> SliceEndMode.REANCHOR
+                        else -> SliceEndMode.CONTINUE
+                    }
+
+                    val segmentPath = Path().apply {
+                        moveTo(lastScrollX, lastScrollY)
+                        lineTo(targetX, targetY)
+                    }
+                    lastScrollX = targetX
+                    lastScrollY = targetY
+
+                    val willContinue = (nextEndMode == SliceEndMode.CONTINUE)
+                    val nextStroke = try {
+                        stroke.continueStroke(
+                            segmentPath,
+                            0L,
+                            if (willContinue) SCROLL_SLICE_DURATION_MS else SCROLL_RELEASE_DURATION_MS,
+                            willContinue,
+                        )
+                    } catch (_: Exception) {
+                        resetScrollState()
+                        return
+                    }
+
+                    activeScrollStroke = if (willContinue) nextStroke else null
+                    dispatchScrollSlice(
+                        displayId = displayId,
+                        stroke = nextStroke,
+                        endMode = nextEndMode,
+                        generation = generation,
+                    )
                 }
 
                 override fun onCancelled(gestureDescription: GestureDescription?) {
-                    isScrollInFlight = false
-                    pendingScrollX = 0f
-                    pendingScrollY = 0f
+                    if (generation != scrollGeneration) return
+                    if ((endMode == SliceEndMode.CONTINUE) &&
+                        isScrollRequested &&
+                        (activeTargetDisplayId() == displayId) &&
+                        (scrollRestartCount < MAX_SCROLL_RESTARTS)
+                    ) {
+                        scrollRestartCount++
+                        beginScrollStroke(displayId)
+                        return
+                    }
+                    resetScrollState()
                 }
             },
             mainHandler
         )
 
         if (!dispatched) {
-            isScrollInFlight = false
+            if (generation == scrollGeneration) {
+                resetScrollState()
+            }
+            return false
         }
+        return true
+    }
+
+    private fun resetScrollState() {
+        scrollGeneration++
+        scrollRestartCount = 0
+        isScrollRequested = false
+        activeScrollStroke = null
+        pendingScrollX = 0f
+        pendingScrollY = 0f
+        scrollDisplayId = Display.INVALID_DISPLAY
+        if (::overlayManager.isInitialized) {
+            overlayManager.setScrollingVisual(isScrolling = false)
+        }
+    }
+
+    fun startPinch(initialScaleFactor: Float = 1f): Boolean {
+        val displayId = activeTargetDisplayId() ?: return false
+        if (isDragActive() || isScrollRequested) return false
+        if (activeScrollStroke != null) {
+            resetScrollState()
+        }
+
+        if (_textSession.value == null) {
+            suppressExternalSoftKeyboard()
+        }
+
+        pendingPinchScale = (pendingPinchScale * initialScaleFactor)
+            .coerceIn(MIN_PENDING_PINCH_SCALE, MAX_PENDING_PINCH_SCALE)
+        isPinchRequested = true
+
+        if ((activePinchStroke1 != null) &&
+            (activePinchStroke2 != null) &&
+            (pinchDisplayId == displayId)
+        ) {
+            return true
+        }
+
+        pinchRestartCount = 0
+        return beginPinchStroke(displayId)
+    }
+
+    fun enqueuePinchZoom(scaleFactor: Float) {
+        if (isDragActive() || isScrollRequested) return
+        val displayId = activeTargetDisplayId() ?: return
+
+        pendingPinchScale = (pendingPinchScale * scaleFactor)
+            .coerceIn(MIN_PENDING_PINCH_SCALE, MAX_PENDING_PINCH_SCALE)
+
+        if (isPinchRequested && (activePinchStroke1 == null || activePinchStroke2 == null)) {
+            beginPinchStroke(displayId)
+        }
+    }
+
+    fun endPinch() {
+        if (!isPinchRequested) return
+        isPinchRequested = false
+        if (activePinchStroke1 == null || activePinchStroke2 == null) {
+            resetPinchState()
+        }
+        scheduleHoverInspection(delayMs = 120L)
+    }
+
+    private fun resolvePinchBoundsAtCursor(
+        displayId: Int,
+        cursorX: Float,
+        cursorY: Float,
+        displayWidth: Int,
+        displayHeight: Int,
+    ): Rect {
+        val fullBounds = Rect(0, 0, displayWidth, displayHeight)
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return fullBounds
+
+        val windows = windowsOnAllDisplays[displayId]
+            .orEmpty()
+            .filter { win ->
+                win.type != AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY &&
+                    win.type != AccessibilityWindowInfo.TYPE_SPLIT_SCREEN_DIVIDER &&
+                    (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                        win.type != AccessibilityWindowInfo.TYPE_MAGNIFICATION_OVERLAY) &&
+                    win.root?.packageName?.toString() != packageName
+            }
+            .sortedByDescending { it.layer }
+
+        val winBounds = Rect()
+        val cx = cursorX.toInt()
+        val cy = cursorY.toInt()
+        for (win in windows) {
+            win.getBoundsInScreen(winBounds)
+            if (winBounds.isEmpty || !winBounds.contains(cx, cy)) continue
+            if (winBounds.intersect(fullBounds) &&
+                winBounds.width() >= MIN_PINCH_WINDOW_SIZE_PX &&
+                winBounds.height() >= MIN_PINCH_WINDOW_SIZE_PX
+            ) {
+                return winBounds
+            }
+            break
+        }
+        return fullBounds
+    }
+
+    private fun pinchFingerPoints(focalX: Float, focalY: Float, halfSpan: Float): FloatArray {
+        val offset = halfSpan * INV_SQRT_2
+        return floatArrayOf(
+            focalX - offset,
+            focalY + offset,
+            focalX + offset,
+            focalY - offset,
+        )
+    }
+
+    private fun beginPinchStroke(displayId: Int): Boolean {
+        val (dispW, dispH) = overlayManager.getDisplayDimensions()
+        val (cursorX, cursorY) = overlayManager.getCursorCoordinates()
+        val targetBounds = resolvePinchBoundsAtCursor(displayId, cursorX, cursorY, dispW, dispH)
+
+        val safeLeft = (targetBounds.left + PINCH_EDGE_MARGIN_PX).coerceAtLeast(PINCH_EDGE_MARGIN_PX)
+        val safeTop = (targetBounds.top + PINCH_EDGE_MARGIN_PX).coerceAtLeast(PINCH_EDGE_MARGIN_PX)
+        val safeRight = (targetBounds.right - PINCH_EDGE_MARGIN_PX)
+            .coerceAtMost(dispW - PINCH_EDGE_MARGIN_PX)
+            .coerceAtLeast(safeLeft + 32f)
+        val safeBottom = (targetBounds.bottom - PINCH_EDGE_MARGIN_PX)
+            .coerceAtMost(dispH - PINCH_EDGE_MARGIN_PX)
+            .coerceAtLeast(safeTop + 32f)
+
+        val usableMinDim = min(safeRight - safeLeft, safeBottom - safeTop).coerceAtLeast(64f)
+        val rawMinHalfSpan = (overlayManager.getMinScalingSpanPx() * 0.56f).coerceAtLeast(44f)
+        val computedMaxHalfSpan = min(
+            usableMinDim * 0.45f / INV_SQRT_2,
+            rawMinHalfSpan * 3.8f,
+        ).coerceAtLeast(56f)
+        val computedMinHalfSpan = min(rawMinHalfSpan, computedMaxHalfSpan * 0.42f).coerceAtLeast(24f)
+        val computedInitialHalfSpan = sqrt(computedMinHalfSpan * computedMaxHalfSpan)
+            .coerceIn(computedMinHalfSpan, computedMaxHalfSpan)
+
+        val maxAxisOffset = computedMaxHalfSpan * INV_SQRT_2
+        val minFocalX = (safeLeft + maxAxisOffset).coerceAtMost((safeLeft + safeRight) * 0.5f)
+        val maxFocalX = (safeRight - maxAxisOffset).coerceAtLeast(minFocalX)
+        val minFocalY = (safeTop + maxAxisOffset).coerceAtMost((safeTop + safeBottom) * 0.5f)
+        val maxFocalY = (safeBottom - maxAxisOffset).coerceAtLeast(minFocalY)
+
+        pinchFocalX = cursorX.coerceIn(minFocalX, maxFocalX)
+        pinchFocalY = cursorY.coerceIn(minFocalY, maxFocalY)
+        minPinchHalfSpan = computedMinHalfSpan
+        maxPinchHalfSpan = computedMaxHalfSpan
+        initialPinchHalfSpan = computedInitialHalfSpan
+
+        val startHalfSpan = initialPinchHalfSpan
+        val desiredScale = pendingPinchScale.coerceIn(MIN_SLICE_PINCH_SCALE, MAX_SLICE_PINCH_SCALE)
+        val slopLead = (overlayManager.getTouchSlopPx() * 0.9f).coerceIn(8f, 24f)
+        val signedLead = when {
+            desiredScale > 1.002f -> slopLead
+            desiredScale < 0.998f -> -slopLead
+            else -> 0f
+        }
+        val targetHalfSpan = (startHalfSpan * desiredScale + signedLead)
+            .coerceIn(minPinchHalfSpan, maxPinchHalfSpan)
+
+        val consumedScale = if (startHalfSpan > 1f) {
+            ((targetHalfSpan - signedLead).coerceAtLeast(1f) / startHalfSpan)
+        } else {
+            1f
+        }
+        if (consumedScale > 0.05f) {
+            pendingPinchScale = (pendingPinchScale / consumedScale)
+                .coerceIn(MIN_PENDING_PINCH_SCALE, MAX_PENDING_PINCH_SCALE)
+        }
+
+        val startPts = pinchFingerPoints(pinchFocalX, pinchFocalY, startHalfSpan)
+        val targetPts = pinchFingerPoints(pinchFocalX, pinchFocalY, targetHalfSpan)
+
+        pinchGeneration++
+        pinchDisplayId = displayId
+        currentPinchHalfSpan = targetHalfSpan
+        lastPinchP1X = targetPts[0]
+        lastPinchP1Y = targetPts[1]
+        lastPinchP2X = targetPts[2]
+        lastPinchP2Y = targetPts[3]
+
+        val path1 = Path().apply {
+            moveTo(startPts[0], startPts[1])
+            lineTo(targetPts[0], targetPts[1])
+        }
+        val path2 = Path().apply {
+            moveTo(startPts[2], startPts[3])
+            lineTo(targetPts[2], targetPts[3])
+        }
+
+        val stroke1 = GestureDescription.StrokeDescription(
+            path1,
+            0L,
+            PINCH_SLICE_DURATION_MS,
+            /* willContinue = */ true,
+        )
+        val stroke2 = GestureDescription.StrokeDescription(
+            path2,
+            0L,
+            PINCH_SLICE_DURATION_MS,
+            /* willContinue = */ true,
+        )
+        activePinchStroke1 = stroke1
+        activePinchStroke2 = stroke2
+
+        return dispatchPinchSlice(
+            displayId = displayId,
+            stroke1 = stroke1,
+            stroke2 = stroke2,
+            endMode = SliceEndMode.CONTINUE,
+            generation = pinchGeneration,
+        )
+    }
+
+    private fun dispatchPinchSlice(
+        displayId: Int,
+        stroke1: GestureDescription.StrokeDescription,
+        stroke2: GestureDescription.StrokeDescription,
+        endMode: SliceEndMode,
+        generation: Int,
+    ): Boolean {
+        val gesture = createGestureBuilder(displayId)
+            .addStroke(stroke1)
+            .addStroke(stroke2)
+            .build()
+
+        val dispatched = dispatchGesture(
+            gesture,
+            object : GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    if (generation != pinchGeneration) return
+                    if (activeTargetDisplayId() != displayId) {
+                        resetPinchState()
+                        return
+                    }
+
+                    when (endMode) {
+                        SliceEndMode.FINAL_RELEASE -> {
+                            resetPinchState()
+                            return
+                        }
+                        SliceEndMode.REANCHOR -> {
+                            if (isPinchRequested) {
+                                activePinchStroke1 = null
+                                activePinchStroke2 = null
+                                beginPinchStroke(displayId)
+                            } else {
+                                resetPinchState()
+                            }
+                            return
+                        }
+                        SliceEndMode.CONTINUE -> {
+                            if (activePinchStroke1 == null || activePinchStroke2 == null) {
+                                resetPinchState()
+                                return
+                            }
+                        }
+                    }
+
+                    pinchRestartCount = 0
+                    val desiredScale = pendingPinchScale.coerceIn(
+                        MIN_SLICE_PINCH_SCALE,
+                        MAX_SLICE_PINCH_SCALE,
+                    )
+                    val targetHalfSpan = (currentPinchHalfSpan * desiredScale)
+                        .coerceIn(minPinchHalfSpan, maxPinchHalfSpan)
+                    val actualScale = if (currentPinchHalfSpan > 1f) {
+                        targetHalfSpan / currentPinchHalfSpan
+                    } else {
+                        1f
+                    }
+                    if (actualScale > 0.05f) {
+                        pendingPinchScale = (pendingPinchScale / actualScale)
+                            .coerceIn(MIN_PENDING_PINCH_SCALE, MAX_PENDING_PINCH_SCALE)
+                    }
+
+                    val hitMinWhileZoomingOut = (targetHalfSpan <= minPinchHalfSpan + 0.5f) &&
+                        (desiredScale < 0.985f)
+                    val hitMaxWhileZoomingIn = (targetHalfSpan >= maxPinchHalfSpan - 0.5f) &&
+                        (desiredScale > 1.015f)
+
+                    val nextEndMode = when {
+                        !isPinchRequested -> {
+                            pendingPinchScale = 1f
+                            SliceEndMode.FINAL_RELEASE
+                        }
+                        hitMinWhileZoomingOut || hitMaxWhileZoomingIn -> SliceEndMode.REANCHOR
+                        else -> SliceEndMode.CONTINUE
+                    }
+
+                    val targetPts = pinchFingerPoints(pinchFocalX, pinchFocalY, targetHalfSpan)
+                    val nextPath1 = Path().apply {
+                        moveTo(lastPinchP1X, lastPinchP1Y)
+                        lineTo(targetPts[0], targetPts[1])
+                    }
+                    val nextPath2 = Path().apply {
+                        moveTo(lastPinchP2X, lastPinchP2Y)
+                        lineTo(targetPts[2], targetPts[3])
+                    }
+
+                    currentPinchHalfSpan = targetHalfSpan
+                    lastPinchP1X = targetPts[0]
+                    lastPinchP1Y = targetPts[1]
+                    lastPinchP2X = targetPts[2]
+                    lastPinchP2Y = targetPts[3]
+
+                    val willContinue = (nextEndMode == SliceEndMode.CONTINUE)
+                    val duration = if (willContinue) {
+                        PINCH_SLICE_DURATION_MS
+                    } else {
+                        PINCH_RELEASE_DURATION_MS
+                    }
+
+                    val nextStroke1: GestureDescription.StrokeDescription
+                    val nextStroke2: GestureDescription.StrokeDescription
+                    try {
+                        nextStroke1 = stroke1.continueStroke(nextPath1, 0L, duration, willContinue)
+                        nextStroke2 = stroke2.continueStroke(nextPath2, 0L, duration, willContinue)
+                    } catch (_: Exception) {
+                        resetPinchState()
+                        return
+                    }
+
+                    activePinchStroke1 = if (willContinue) nextStroke1 else null
+                    activePinchStroke2 = if (willContinue) nextStroke2 else null
+                    dispatchPinchSlice(
+                        displayId = displayId,
+                        stroke1 = nextStroke1,
+                        stroke2 = nextStroke2,
+                        endMode = nextEndMode,
+                        generation = generation,
+                    )
+                }
+
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    if (generation != pinchGeneration) return
+                    if ((endMode == SliceEndMode.CONTINUE) &&
+                        isPinchRequested &&
+                        (activeTargetDisplayId() == displayId) &&
+                        (pinchRestartCount < MAX_PINCH_RESTARTS)
+                    ) {
+                        pinchRestartCount++
+                        beginPinchStroke(displayId)
+                        return
+                    }
+                    resetPinchState()
+                }
+            },
+            mainHandler
+        )
+
+        if (!dispatched) {
+            if (generation == pinchGeneration) {
+                resetPinchState()
+            }
+            return false
+        }
+        return true
+    }
+
+    private fun resetPinchState() {
+        pinchGeneration++
+        pinchRestartCount = 0
+        isPinchRequested = false
+        activePinchStroke1 = null
+        activePinchStroke2 = null
+        pendingPinchScale = 1f
+        pinchDisplayId = Display.INVALID_DISPLAY
     }
 
     /**
@@ -818,7 +1386,8 @@ class TouchpadAccessibilityService : AccessibilityService() {
 
     private fun dispatchEdgeBackGestureOnDisplay(displayId: Int): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
-        if (isDragActive()) return false
+        if (isAnotherGestureRequested()) return false
+        clearFinishedAuxiliaryGestures()
         val (width, height) = overlayManager.getDisplayDimensions()
         val startX = 2f
         val endX = (width * 0.22f).coerceIn(90f, 240f).coerceAtMost((width - 2).toFloat())
@@ -833,7 +1402,8 @@ class TouchpadAccessibilityService : AccessibilityService() {
 
     private fun dispatchBottomHomeSwipeOnDisplay(displayId: Int): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
-        if (isDragActive()) return false
+        if (isAnotherGestureRequested()) return false
+        clearFinishedAuxiliaryGestures()
         val (width, height) = overlayManager.getDisplayDimensions()
         val centerX = (width * 0.5f).coerceAtLeast(2f)
         val startY = (height - 2).coerceAtLeast(10).toFloat()
@@ -848,7 +1418,8 @@ class TouchpadAccessibilityService : AccessibilityService() {
 
     private fun dispatchOverviewSwipeHoldOnDisplay(displayId: Int): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
-        if (isDragActive()) return false
+        if (isAnotherGestureRequested()) return false
+        clearFinishedAuxiliaryGestures()
         val (width, height) = overlayManager.getDisplayDimensions()
         val centerX = (width * 0.5f).coerceAtLeast(2f)
         val startY = (height - 2).coerceAtLeast(20).toFloat()
@@ -1119,10 +1690,25 @@ class TouchpadAccessibilityService : AccessibilityService() {
         private const val DRAG_SLICE_DURATION_MS = 55L
         private const val DRAG_RELEASE_DURATION_MS = 25L
         private const val MAX_DRAG_RESTARTS = 3
-        private const val SCROLL_DURATION_MS = 65L
-        private const val MIN_SCROLL_DISPATCH_PX = 4f
-        private const val SINGLE_SCROLL_STROKE_PX = 260f
-        private const val MAX_SCROLL_STEP_PX = 640f
+
+        private const val SCROLL_SLICE_DURATION_MS = 45L
+        private const val SCROLL_RELEASE_DURATION_MS = 25L
+        private const val MAX_SCROLL_RESTARTS = 3
+        private const val SCROLL_EDGE_MARGIN_PX = 4f
+        private const val SCROLL_REANCHOR_HEADROOM_PX = 28f
+        private const val SINGLE_SCROLL_SLICE_PX = 320f
+        private const val MAX_PENDING_SCROLL_PX = 960f
+
+        private const val PINCH_SLICE_DURATION_MS = 45L
+        private const val PINCH_RELEASE_DURATION_MS = 25L
+        private const val MAX_PINCH_RESTARTS = 3
+        private const val PINCH_EDGE_MARGIN_PX = 8f
+        private const val MIN_PINCH_WINDOW_SIZE_PX = 220
+        private const val MIN_SLICE_PINCH_SCALE = 0.65f
+        private const val MAX_SLICE_PINCH_SCALE = 1.55f
+        private const val MIN_PENDING_PINCH_SCALE = 0.15f
+        private const val MAX_PENDING_PINCH_SCALE = 6.5f
+        private const val INV_SQRT_2 = 0.70710677f
 
         private const val HOVER_THROTTLE_MS = 90L
         private const val HOVER_SETTLE_DELAY_MS = 65L

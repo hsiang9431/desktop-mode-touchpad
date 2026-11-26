@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import androidx.core.content.edit
 import com.example.desktoptouchpad.service.TouchpadAccessibilityService
 import kotlin.math.hypot
+import kotlin.math.pow
 
 class GestureController {
 
@@ -119,11 +120,45 @@ class GestureController {
         }
     }
 
-    fun onTwoFingerScroll(scrollDx: Float, scrollDy: Float) {
-        val service = TouchpadAccessibilityService.instance ?: return
+    private fun scaleScrollDelta(scrollDx: Float, scrollDy: Float): Pair<Float, Float> {
         val direction = if (naturalScrolling) 1.0f else -1.0f
         val scrollGain = 1.75f * direction
-        service.enqueueScroll(scrollDx * scrollGain, scrollDy * scrollGain)
+        return Pair(scrollDx * scrollGain, scrollDy * scrollGain)
+    }
+
+    fun onTwoFingerScrollStart(initialScrollDx: Float = 0f, initialScrollDy: Float = 0f): Boolean {
+        val service = TouchpadAccessibilityService.instance ?: return false
+        val (dx, dy) = scaleScrollDelta(initialScrollDx, initialScrollDy)
+        return service.startScroll(dx, dy)
+    }
+
+    fun onTwoFingerScroll(scrollDx: Float, scrollDy: Float) {
+        val service = TouchpadAccessibilityService.instance ?: return
+        val (dx, dy) = scaleScrollDelta(scrollDx, scrollDy)
+        service.enqueueScroll(dx, dy)
+    }
+
+    fun onTwoFingerScrollEnd() {
+        TouchpadAccessibilityService.instance?.endScroll()
+    }
+
+    private fun applyPinchGain(zoomFactor: Float): Float {
+        val clamped = zoomFactor.coerceIn(0.5f, 2.0f)
+        return clamped.pow(PINCH_ZOOM_EXPONENT)
+    }
+
+    fun onPinchStart(initialZoomFactor: Float = 1f): Boolean {
+        val service = TouchpadAccessibilityService.instance ?: return false
+        return service.startPinch(applyPinchGain(initialZoomFactor))
+    }
+
+    fun onPinchZoom(zoomFactor: Float) {
+        val service = TouchpadAccessibilityService.instance ?: return
+        service.enqueuePinchZoom(applyPinchGain(zoomFactor))
+    }
+
+    fun onPinchEnd() {
+        TouchpadAccessibilityService.instance?.endPinch()
     }
 
     fun onBack(): Boolean = TouchpadAccessibilityService.instance?.performBack() ?: false
@@ -149,6 +184,7 @@ class GestureController {
         private const val KEY_NATURAL_SCROLLING = "natural_scrolling"
         private const val KEY_THREE_FINGER_GESTURES = "three_finger_gestures"
         private const val KEY_TOUCHPAD_LANDSCAPE = "touchpad_landscape"
+        private const val PINCH_ZOOM_EXPONENT = 1.25f
 
         const val DEFAULT_SENSITIVITY = 1.6f
         const val DEFAULT_TAP_HOLD_DELAY_MS = 350L

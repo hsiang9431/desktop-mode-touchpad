@@ -13,7 +13,8 @@ A Samsung DeX-style phone touchpad and native Gboard text-input bridge for **And
 - **Multi-Touch Gestures, Action Bar & Persistent Options**:
   - **1-finger move & tap**: DeX-style velocity-accelerated pointer movement and left-click on the external screen, with an adjustable **Pointer Sensitivity** slider (`0.5×`–`3.5×`).
   - **Hold-to-Drag (Release-Locked)**: Engage drag via **tap & hold** on the touchpad (configurable **Tap & Hold Delay** slider from `200 ms`–`600 ms`) or holding the **Click / Drag** button. Continuous stroke chaining (`StrokeDescription.continueStroke`) and drag-owner tracking ensure dragging only ends when every finger holding the drag lifts.
-  - **2-finger scroll**: Smooth vertical & horizontal scrolling with a **Natural Scrolling** toggle.
+  - **2-finger scroll (Release-Locked)**: Continuous stroke-chained vertical & horizontal scrolling with a **Natural Scrolling** toggle that stays active until every finger lifts from the touchpad.
+  - **2-finger pinch to zoom**: Smooth continuous zoom in/out centered at the external cursor position.
   - **2-finger tap / Right Click**: Secondary / right click at the cursor position via 2-finger tap or the **Right Click** button.
   - **External-Only Navigation & 3-Finger Gestures**: **Back** and **Home** buttons plus **3-finger tap** (Back), **3-finger swipe down** (Home), and **3-finger swipe up** (App Switcher) target only the external display without minimizing the phone touchpad app. Includes a **3-Finger Gestures** toggle in **Options**, with all preferences persisted via `SharedPreferences`.
 - **OLED Dim Theme**: Pure-black low-luminance OLED interface with quick **Center** and **Options** controls in the status header and `FLAG_KEEP_SCREEN_ON` active while an external display is connected.

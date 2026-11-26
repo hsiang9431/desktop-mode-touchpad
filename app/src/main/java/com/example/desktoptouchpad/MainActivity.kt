@@ -125,7 +125,10 @@ class MainActivity : ComponentActivity() {
 
     private val clearInputActivityRunnable: Runnable = Runnable {
         if (isDestroyed || isFinishing) return@Runnable
-        if (isTouchDown || TouchpadAccessibilityService.isDragging.value) {
+        if (isTouchDown ||
+            TouchpadAccessibilityService.isDragging.value ||
+            TouchpadAccessibilityService.instance?.hasActiveContinuousGesture() == true
+        ) {
             mainHandler.postDelayed(clearInputActivityRunnable, INPUT_IDLE_CLEAR_DELAY_MS)
             return@Runnable
         }
@@ -978,6 +981,12 @@ private fun Modifier.rotateLayout90Clockwise(): Modifier = layout { measurable, 
     }
 }
 
+private enum class TwoFingerGestureMode {
+    NONE,
+    SCROLL,
+    PINCH,
+}
+
 @Composable
 private fun DeXTouchpadSurface(
     modifier: Modifier,
@@ -1005,35 +1014,62 @@ private fun DeXTouchpadSurface(
             .border(1.5.dp, borderColor, RoundedCornerShape(22.dp))
             .pointerInput(gestureController) {
                 val tapSlopPx = 8.dp.toPx()
-                val scrollSlopPx = 4.dp.toPx()
+                val scrollSlopPx = 6.dp.toPx()
+                val pinchSlopPx = 12.dp.toPx()
+                val minPinchFingerDistPx = 8.dp.toPx()
                 val threeFingerSwipeThresholdPx = 44.dp.toPx()
                 val multiFingerTapTimeoutMs = 230L
 
                 awaitEachGesture {
                     val firstDown = awaitFirstDown(requireUnconsumed = false)
-                    firstDown.consume()
+                    val initialPressed = currentEvent.changes.filter { it.pressed }
+                    if (initialPressed.isNotEmpty()) {
+                        initialPressed.forEach { it.consume() }
+                    } else {
+                        firstDown.consume()
+                    }
 
                     val downPos = firstDown.position
                     val downTime = firstDown.uptimeMillis
                     val tapHoldDelayMs = gestureController.tapHoldDelayMs
                     var lastEventTime = downTime
-                    var maxPointerCount = 1
+                    var maxPointerCount = initialPressed.size.coerceAtLeast(1)
                     var maxSingleFingerDisplacement = 0f
-                    var totalTwoFingerDistance = 0f
+                    var maxTwoFingerPanFromStart = 0f
+                    var maxTwoFingerSpanDelta = 0f
                     var totalThreeFingerDistance = 0f
                     var isMovingCursor = false
                     var isTapDragActive = false
                     var dragStartFailed = false
                     var dragPointerId = firstDown.id
+                    var twoFingerMode = TwoFingerGestureMode.NONE
+                    var pinchPointerId1 = firstDown.id
+                    var pinchPointerId2 = firstDown.id
                     var threeFingerSwipeTriggered = false
 
-                    var previousCentroid: Offset? = null
+                    var twoFingerStartCentroid: Offset? = if (initialPressed.size == 2) {
+                        Offset(
+                            x = (initialPressed[0].position.x + initialPressed[1].position.x) * 0.5f,
+                            y = (initialPressed[0].position.y + initialPressed[1].position.y) * 0.5f,
+                        )
+                    } else {
+                        null
+                    }
+                    var twoFingerStartSpan: Float = if (initialPressed.size == 2) {
+                        (initialPressed[0].position - initialPressed[1].position).getDistance()
+                    } else {
+                        0f
+                    }
+                    var previousCentroid: Offset? = twoFingerStartCentroid
                     var threeFingerStartCentroid: Offset? = null
 
                     try {
                         while (true) {
                             val pendingHoldThresholdMs: Long? = when {
-                                isTapDragActive || dragStartFailed || gestureController.isDragActive -> null
+                                isTapDragActive ||
+                                    dragStartFailed ||
+                                    gestureController.isDragActive ||
+                                    twoFingerMode != TwoFingerGestureMode.NONE -> null
                                 maxPointerCount != 1 -> null
                                 !isMovingCursor && maxSingleFingerDisplacement <= tapSlopPx -> tapHoldDelayMs
                                 else -> null
@@ -1099,6 +1135,63 @@ private fun DeXTouchpadSurface(
                                 continue
                             }
 
+                            if (twoFingerMode == TwoFingerGestureMode.SCROLL) {
+                                // Once scrolling, never end until every finger lifts from the touchpad.
+                                val movingPointers = activeChanges.filter { it.previousPressed }
+                                if (movingPointers.isNotEmpty()) {
+                                    var sumDx = 0f
+                                    var sumDy = 0f
+                                    for (change in movingPointers) {
+                                        sumDx += change.position.x - change.previousPosition.x
+                                        sumDy += change.position.y - change.previousPosition.y
+                                    }
+                                    val avgDelta = Offset(
+                                        x = sumDx / movingPointers.size,
+                                        y = sumDy / movingPointers.size
+                                    )
+                                    val rotatedDelta = rotateTouchpadDelta(
+                                        avgDelta,
+                                        currentTouchpadLandscape
+                                    )
+                                    if (hypot(rotatedDelta.x, rotatedDelta.y) > 0f) {
+                                        gestureController.onTwoFingerScroll(
+                                            rotatedDelta.x,
+                                            rotatedDelta.y
+                                        )
+                                    }
+                                }
+                                event.changes.forEach { it.consume() }
+                                continue
+                            }
+
+                            if (twoFingerMode == TwoFingerGestureMode.PINCH) {
+                                // Once pinching, keep pinch active until every finger lifts from the touchpad.
+                                if (activeChanges.size >= 2) {
+                                    var p1 = activeChanges.firstOrNull { it.id == pinchPointerId1 }
+                                    var p2 = activeChanges.firstOrNull {
+                                        it.id == pinchPointerId2 && it.id != pinchPointerId1
+                                    }
+                                    if (p1 == null || p2 == null) {
+                                        p1 = activeChanges[0]
+                                        p2 = activeChanges[1]
+                                        pinchPointerId1 = p1.id
+                                        pinchPointerId2 = p2.id
+                                    }
+                                    if (p1.previousPressed && p2.previousPressed) {
+                                        val prevSpan = (p1.previousPosition - p2.previousPosition).getDistance()
+                                        val currSpan = (p1.position - p2.position).getDistance()
+                                        if (prevSpan >= minPinchFingerDistPx && currSpan >= minPinchFingerDistPx) {
+                                            val zoomFactor = (currSpan / prevSpan).coerceIn(0.70f, 1.42f)
+                                            if (abs(zoomFactor - 1f) > 0.0015f) {
+                                                gestureController.onPinchZoom(zoomFactor)
+                                            }
+                                        }
+                                    }
+                                }
+                                event.changes.forEach { it.consume() }
+                                continue
+                            }
+
                             val pointerCount = activeChanges.size
                             if (pointerCount > maxPointerCount) {
                                 maxPointerCount = pointerCount
@@ -1108,9 +1201,9 @@ private fun DeXTouchpadSurface(
                             if (pointerCount == 1 && maxPointerCount == 1) {
                                 val change = activeChanges.first()
                                 val delta = rotateTouchpadDelta(
-                                        change.position - change.previousPosition,
-                                        currentTouchpadLandscape
-                                    )
+                                    change.position - change.previousPosition,
+                                    currentTouchpadLandscape
+                                )
                                 val stepDist = hypot(delta.x, delta.y)
                                 val displacementFromDown = hypot(
                                     change.position.x - downPos.x,
@@ -1160,15 +1253,64 @@ private fun DeXTouchpadSurface(
                                 )
 
                                 val prev = previousCentroid
-                                if (pointerCount == 2 && maxPointerCount == 2 && prev != null) {
-                                    val scrollDelta = rotateTouchpadDelta(
-                                        currentCentroid - prev,
-                                        currentTouchpadLandscape
-                                    )
-                                    val stepScroll = hypot(scrollDelta.x, scrollDelta.y)
-                                    totalTwoFingerDistance += stepScroll
-                                    if (totalTwoFingerDistance > scrollSlopPx && stepScroll > 0f) {
-                                        gestureController.onTwoFingerScroll(scrollDelta.x, scrollDelta.y)
+                                if (pointerCount == 2 && maxPointerCount == 2) {
+                                    val c1 = activeChanges[0]
+                                    val c2 = activeChanges[1]
+                                    val currentSpan = (c1.position - c2.position).getDistance()
+                                    val startCentroid = twoFingerStartCentroid
+                                    if (startCentroid == null) {
+                                        twoFingerStartCentroid = currentCentroid
+                                        twoFingerStartSpan = currentSpan
+                                    } else {
+                                        val panFromStart = (currentCentroid - startCentroid).getDistance()
+                                        val spanDelta = abs(currentSpan - twoFingerStartSpan)
+                                        if (panFromStart > maxTwoFingerPanFromStart) {
+                                            maxTwoFingerPanFromStart = panFromStart
+                                        }
+                                        if (spanDelta > maxTwoFingerSpanDelta) {
+                                            maxTwoFingerSpanDelta = spanDelta
+                                        }
+
+                                        if (spanDelta >= pinchSlopPx &&
+                                            currentSpan >= minPinchFingerDistPx &&
+                                            spanDelta > panFromStart * 1.15f
+                                        ) {
+                                            twoFingerMode = TwoFingerGestureMode.PINCH
+                                            pinchPointerId1 = c1.id
+                                            pinchPointerId2 = c2.id
+                                            val prevSpan = if (c1.previousPressed && c2.previousPressed) {
+                                                (c1.previousPosition - c2.previousPosition).getDistance()
+                                            } else {
+                                                twoFingerStartSpan
+                                            }
+                                            val initialFactor = if (prevSpan >= minPinchFingerDistPx) {
+                                                val raw = (currentSpan / prevSpan).coerceIn(0.80f, 1.25f)
+                                                if (abs(raw - 1f) > 0.005f) {
+                                                    raw
+                                                } else if (currentSpan > twoFingerStartSpan) {
+                                                    1.03f
+                                                } else {
+                                                    0.97f
+                                                }
+                                            } else if (currentSpan > twoFingerStartSpan) {
+                                                1.03f
+                                            } else {
+                                                0.97f
+                                            }
+                                            gestureController.onPinchStart(initialFactor)
+                                        } else if (panFromStart >= scrollSlopPx &&
+                                            panFromStart > spanDelta * 0.9f
+                                        ) {
+                                            twoFingerMode = TwoFingerGestureMode.SCROLL
+                                            val initialScrollDelta = rotateTouchpadDelta(
+                                                currentCentroid - startCentroid,
+                                                currentTouchpadLandscape
+                                            )
+                                            gestureController.onTwoFingerScrollStart(
+                                                initialScrollDelta.x,
+                                                initialScrollDelta.y
+                                            )
+                                        }
                                     }
                                 } else if (pointerCount == 3 && maxPointerCount == 3) {
                                     val start3 = threeFingerStartCentroid
@@ -1208,11 +1350,21 @@ private fun DeXTouchpadSurface(
                         if (isTapDragActive) {
                             gestureController.onDragEnd(GestureController.DragOwner.TOUCHPAD)
                         }
+                        if (twoFingerMode == TwoFingerGestureMode.SCROLL) {
+                            gestureController.onTwoFingerScrollEnd()
+                        }
+                        if (twoFingerMode == TwoFingerGestureMode.PINCH) {
+                            gestureController.onPinchEnd()
+                        }
                     }
 
                     val gestureDuration = (lastEventTime - downTime).coerceAtLeast(0L)
 
-                    if (!isTapDragActive && !threeFingerSwipeTriggered && !gestureController.isDragActive) {
+                    if (!isTapDragActive &&
+                        twoFingerMode == TwoFingerGestureMode.NONE &&
+                        !threeFingerSwipeTriggered &&
+                        !gestureController.isDragActive
+                    ) {
                         when (maxPointerCount) {
                             1 -> if (!isMovingCursor &&
                                 !dragStartFailed &&
@@ -1224,7 +1376,8 @@ private fun DeXTouchpadSurface(
                                 }
                             }
 
-                            2 -> if (totalTwoFingerDistance <= tapSlopPx * 1.5f &&
+                            2 -> if (maxTwoFingerPanFromStart <= tapSlopPx * 1.5f &&
+                                maxTwoFingerSpanDelta <= pinchSlopPx &&
                                 gestureDuration <= multiFingerTapTimeoutMs + 50L
                             ) {
                                 if (gestureController.onSecondaryTap()) {
