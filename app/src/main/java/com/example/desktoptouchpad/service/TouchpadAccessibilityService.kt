@@ -213,6 +213,10 @@ class TouchpadAccessibilityService : AccessibilityService() {
         externalTextBridge.sendBackspaceToSelectedBox()
     }
 
+    fun isExternalFocusTransitionActive(): Boolean {
+        return externalTextBridge.isExternalFocusTransitionActive()
+    }
+
     fun moveCursor(deltaX: Float, deltaY: Float) {
         if (!::overlayManager.isInitialized) return
         overlayManager.updateCursorPosition(deltaX, deltaY)

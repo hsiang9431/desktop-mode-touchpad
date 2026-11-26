@@ -68,7 +68,13 @@ class ExternalTextBridge(
     private var lastExternalEditorAction: Int = EditorInfo.IME_ACTION_UNSPECIFIED
 
     private var pendingAction: PendingForceInputAction? = null
+    private var externalTapTransitionUntilUptimeMs: Long = 0L
     private var api33Helper: Any? = null
+
+    fun isExternalFocusTransitionActive(): Boolean {
+        return (pendingAction != null) ||
+            (SystemClock.uptimeMillis() < externalTapTransitionUntilUptimeMs)
+    }
 
     private val restorePhoneKeyboardRunnable: Runnable = Runnable {
         val current = _session.value
@@ -179,6 +185,7 @@ class ExternalTextBridge(
         if (_session.value == null) {
             onSuppressExternalSoftKeyboard()
         } else {
+            externalTapTransitionUntilUptimeMs = SystemClock.uptimeMillis() + 350L
             mainHandler.removeCallbacks(postTapRefreshRunnable)
             mainHandler.postDelayed(postTapRefreshRunnable, 115L)
         }

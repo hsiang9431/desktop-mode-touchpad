@@ -23,8 +23,10 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.ButtonDefaults
@@ -53,8 +55,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
 import com.example.desktoptouchpad.R
 import com.example.desktoptouchpad.input.ExternalTextSession
 import com.example.desktoptouchpad.service.TouchpadAccessibilityService
@@ -66,6 +71,7 @@ private class RelayEditText(context: Context) : EditText(context) {
     var appliedTextColor: Int = 0
     var appliedHintColor: Int = 0
     var isClosingKeyboard: Boolean = false
+    var lostWindowFocusWhileImeOpen: Boolean = false
     var pendingShowSoftInputOnWindowFocus: Boolean = false
     var onBackPreIme: (() -> Unit)? = null
 
@@ -154,8 +160,10 @@ fun PhoneKeyboardRelayBar(
     val activity = remember(context) { context.findActivity() }
     val defaultPlaceholder = stringResource(R.string.keyboard_placeholder)
     val latestOnDismiss by rememberUpdatedState(onDismissKeyboard)
+    val isImeVisible = WindowInsets.isImeVisible
 
     var editTextRef by remember { mutableStateOf<RelayEditText?>(null) }
+    var hasImeShownInSession by remember(session.sessionId) { mutableStateOf(false) }
 
     LaunchedEffect(session.sessionId, session.refocusTrigger, editTextRef) {
         val view = editTextRef ?: return@LaunchedEffect
@@ -163,6 +171,34 @@ fun PhoneKeyboardRelayBar(
         TouchpadAccessibilityService.instance?.allowPhoneSoftKeyboard()
         delay(30.milliseconds)
         requestPhoneSoftKeyboard(activity, view)
+    }
+
+    // Detect when the user manually hides Gboard using Gboard's bottom-left downward arrow
+    // (or system back gesture), which hides IME insets while keeping phone window focus.
+    LaunchedEffect(isImeVisible, editTextRef) {
+        val view = editTextRef ?: return@LaunchedEffect
+        if (isImeVisible) {
+            if (view.hasWindowFocus()) {
+                hasImeShownInSession = true
+                view.lostWindowFocusWhileImeOpen = false
+            }
+        } else if (hasImeShownInSession && !view.isClosingKeyboard) {
+            delay(65.milliseconds)
+            val rootImeStillHidden = ViewCompat.getRootWindowInsets(view)
+                ?.isVisible(WindowInsetsCompat.Type.ime()) != true
+            val externalTransitionActive =
+                TouchpadAccessibilityService.instance?.isExternalFocusTransitionActive() == true
+
+            if (!view.isClosingKeyboard &&
+                rootImeStillHidden &&
+                view.hasWindowFocus() &&
+                !view.lostWindowFocusWhileImeOpen &&
+                !externalTransitionActive
+            ) {
+                hidePhoneSoftKeyboard(activity, view)
+                latestOnDismiss()
+            }
+        }
     }
 
     DisposableEffect(Unit) {
@@ -264,14 +300,14 @@ fun PhoneKeyboardRelayBar(
                                         showImeOnFocusedEditText(ctx.findActivity(), this)
                                     }
                                 } else {
-                                    // Keep the phone keyboard always open while this screen is visible
+                                    lostWindowFocusWhileImeOpen = true
                                     postDelayed(
                                         {
                                             val act = ctx.findActivity()
-                                            val isActivityVisible = (act as? androidx.lifecycle.LifecycleOwner)
+                                            val isActivityVisible = (act as? LifecycleOwner)
                                                 ?.lifecycle
                                                 ?.currentState
-                                                ?.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED) != false
+                                                ?.isAtLeast(Lifecycle.State.STARTED) != false
                                             if (isAttachedToWindow &&
                                                 !isClosingKeyboard &&
                                                 isActivityVisible &&
