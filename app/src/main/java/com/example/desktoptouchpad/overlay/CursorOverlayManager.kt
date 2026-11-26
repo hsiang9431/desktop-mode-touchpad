@@ -49,7 +49,10 @@ enum class CursorStyle(
             this == RESIZE_DIAG_NE_SW
 }
 
-class CursorOverlayManager(private val service: AccessibilityService) {
+class CursorOverlayManager(
+    private val service: AccessibilityService,
+    private val onAllExternalDisplaysLost: (() -> Unit)? = null,
+) {
 
     private val displayManager =
         service.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
@@ -96,10 +99,17 @@ class CursorOverlayManager(private val service: AccessibilityService) {
         }
 
         override fun onDisplayRemoved(displayId: Int) {
-            if (displayId == activeDisplayId) {
+            val wasActive = (displayId == activeDisplayId)
+            if (wasActive) {
                 detachOverlay()
             }
             syncTargetDisplay()
+            if (wasActive &&
+                activeDisplayId == Display.INVALID_DISPLAY &&
+                !hasConnectedExternalDisplay(displayManager)
+            ) {
+                onAllExternalDisplaysLost?.invoke()
+            }
         }
 
         override fun onDisplayChanged(displayId: Int) {
@@ -143,15 +153,7 @@ class CursorOverlayManager(private val service: AccessibilityService) {
         attachToDisplay(targetDisplay)
     }
 
-    private fun findExternalDisplay(): Display? {
-        val secondaryDisplays = displayManager.displays.filter { display ->
-            display.displayId != Display.DEFAULT_DISPLAY &&
-                display.state != Display.STATE_OFF
-        }
-        return secondaryDisplays.firstOrNull { (it.flags and Display.FLAG_PRESENTATION) != 0 }
-            ?: secondaryDisplays.firstOrNull { (it.flags and Display.FLAG_PRIVATE) == 0 }
-            ?: secondaryDisplays.firstOrNull()
-    }
+    private fun findExternalDisplay(): Display? = findExternalDisplay(displayManager)
 
     private fun attachToDisplay(display: Display) {
         val overlayContext = createOverlayContext(display)
@@ -267,9 +269,18 @@ class CursorOverlayManager(private val service: AccessibilityService) {
 
     private fun refreshActiveDisplayBounds() {
         val display = displayManager.getDisplay(activeDisplayId)
-        if (display == null || display.state == Display.STATE_OFF) {
+        if (display == null) {
             detachOverlay()
             syncTargetDisplay()
+            if (activeDisplayId == Display.INVALID_DISPLAY &&
+                !hasConnectedExternalDisplay(displayManager)
+            ) {
+                onAllExternalDisplaysLost?.invoke()
+            }
+            return
+        }
+        if (display.state == Display.STATE_OFF) {
+            // Monitor may blank briefly during HDMI/DP link training or mode-switching on plug-in.
             return
         }
         val wm = windowManager ?: return
@@ -404,5 +415,34 @@ class CursorOverlayManager(private val service: AccessibilityService) {
         appliedStyle = CursorStyle.ARROW
         activeDisplayId = Display.INVALID_DISPLAY
         _displayInfo.value = null
+    }
+
+    companion object {
+        private fun isExternalCandidateDisplay(display: Display): Boolean {
+            if (display.displayId == Display.DEFAULT_DISPLAY) return false
+            val flags = display.flags
+            val isPresentation = (flags and Display.FLAG_PRESENTATION) != 0
+            val isPublicSecondary = (flags and Display.FLAG_PRIVATE) == 0
+            return isPresentation || isPublicSecondary
+        }
+
+        /**
+         * Returns an active (non-off) external display ready to host the cursor overlay.
+         */
+        fun findExternalDisplay(displayManager: DisplayManager): Display? {
+            val secondaryDisplays = displayManager.displays.filter { display ->
+                isExternalCandidateDisplay(display) && display.state != Display.STATE_OFF
+            }
+            return secondaryDisplays.firstOrNull { (it.flags and Display.FLAG_PRESENTATION) != 0 }
+                ?: secondaryDisplays.firstOrNull()
+        }
+
+        /**
+         * Returns true if any external display is physically/logically connected, even if its
+         * screen state is temporarily [Display.STATE_OFF] during plug-in handshake or mode-set.
+         */
+        fun hasConnectedExternalDisplay(displayManager: DisplayManager): Boolean {
+            return displayManager.displays.any { isExternalCandidateDisplay(it) }
+        }
     }
 }

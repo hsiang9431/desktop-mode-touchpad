@@ -150,10 +150,17 @@ class ExternalTextBridge(
         cancelPendingCallbacks()
         pendingAction = null
         targetNode = null
+        targetDisplayId = Display.INVALID_DISPLAY
         targetPackage = null
         hasModifiedTargetInSession = false
+        lastExternalEditorPackage = null
+        lastExternalEditorAction = EditorInfo.IME_ACTION_UNSPECIFIED
+        externalTapTransitionUntilUptimeMs = 0L
         lastTapDisplayId = Display.INVALID_DISPLAY
         lastTapPoint = null
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            (api33Helper as? Api33InputMethodBridge)?.clear()
+        }
         _session.value = null
     }
 
@@ -821,6 +828,11 @@ private class Api33InputMethodBridge(
             activeExternalPackage = null
             activeExternalInputType = InputType.TYPE_NULL
         }
+    }
+
+    fun clear() {
+        activeExternalPackage = null
+        activeExternalInputType = InputType.TYPE_NULL
     }
 
     fun executeIfRealEditorConnected(action: PendingForceInputAction): Boolean {

@@ -93,7 +93,10 @@ class TouchpadAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         configureAccessibilityFlags()
 
-        overlayManager = CursorOverlayManager(this)
+        overlayManager = CursorOverlayManager(
+            service = this,
+            onAllExternalDisplaysLost = { handleExternalDisplayDisconnected() },
+        )
         overlayManager.start()
         instance = this
         _isConnected.value = true
@@ -106,15 +109,11 @@ class TouchpadAccessibilityService : AccessibilityService() {
             overlayManager.displayInfo.collect { info ->
                 _externalDisplay.value = info
                 if (info == null) {
-                    isPhoneKeyboardAllowed = false
-                    resetDragState()
-                    pendingScrollX = 0f
-                    pendingScrollY = 0f
-                    externalTextBridge.clearAll()
+                    handleExternalDisplayDisconnected(notifyActivityListener = false)
                 } else {
                     scheduleHoverInspection(delayMs = 80L)
+                    syncSoftKeyboardMode()
                 }
-                syncSoftKeyboardMode()
             }
         }
 
@@ -177,8 +176,28 @@ class TouchpadAccessibilityService : AccessibilityService() {
         _textSession.value = null
     }
 
+    internal fun handleExternalDisplayDisconnected(notifyActivityListener: Boolean = true) {
+        mainHandler.removeCallbacks(deferredHoverCheckRunnable)
+        isPhoneKeyboardAllowed = false
+        resetDragState()
+        pendingScrollX = 0f
+        pendingScrollY = 0f
+        isScrollInFlight = false
+        externalTextBridge.clearAll()
+        if (::overlayManager.isInitialized && overlayManager.activeDisplayId != Display.INVALID_DISPLAY) {
+            overlayManager.syncTargetDisplay()
+        }
+        _externalDisplay.value = null
+        _textSession.value = null
+        applySoftKeyboardShowMode(SHOW_MODE_AUTO)
+        if (notifyActivityListener) {
+            onExternalDisplayUnpluggedListener?.invoke()
+        }
+    }
+
     private fun shouldSuppressExternalSoftKeyboard(): Boolean {
         return (_externalDisplay.value != null) &&
+            (activeTargetDisplayId() != null) &&
             isMainActivityStarted &&
             !isPhoneKeyboardAllowed &&
             (_textSession.value == null)
@@ -1130,11 +1149,17 @@ class TouchpadAccessibilityService : AccessibilityService() {
         var instance: TouchpadAccessibilityService? = null
             private set
 
+        var onExternalDisplayUnpluggedListener: (() -> Unit)? = null
+
         private var isMainActivityStarted: Boolean = false
 
         fun setMainActivityStarted(started: Boolean) {
             isMainActivityStarted = started
             instance?.syncSoftKeyboardMode()
+        }
+
+        fun notifyExternalDisplayUnplugged() {
+            instance?.handleExternalDisplayDisconnected(notifyActivityListener = false)
         }
 
         private val _isConnected = MutableStateFlow(false)

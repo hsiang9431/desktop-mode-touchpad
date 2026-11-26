@@ -1,10 +1,21 @@
 package com.example.desktoptouchpad
 
+import android.app.ActivityOptions
+import android.app.KeyguardManager
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.hardware.display.DisplayManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
+import android.view.Display
 import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
@@ -41,6 +52,7 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.rememberSliderState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -65,6 +77,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.desktoptouchpad.gesture.GestureController
+import com.example.desktoptouchpad.overlay.CursorOverlayManager
 import com.example.desktoptouchpad.overlay.ExternalDisplayInfo
 import com.example.desktoptouchpad.service.TouchpadAccessibilityService
 import com.example.desktoptouchpad.ui.PhoneKeyboardRelayBar
@@ -88,18 +101,128 @@ private val OledDimColorScheme = darkColorScheme(
 class MainActivity : ComponentActivity() {
 
     private val gestureController = GestureController()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private lateinit var displayManager: DisplayManager
+
+    private var desiredWindowFocusable: Boolean = true
     private var appliedWindowFocusable: Boolean = true
+    private var desiredKeepScreenOn: Boolean = false
+    private var isActivityStarted: Boolean = false
+    private var isUnplugExitArmed: Boolean = false
+    private var isUnplugConfirmationPending: Boolean = false
+    private var isExitingFromUnplug: Boolean = false
+    private var isScreenOffReceiverRegistered: Boolean = false
+
+    private val armUnplugExitRunnable = Runnable {
+        if (!isDestroyed && !isFinishing &&
+            CursorOverlayManager.hasConnectedExternalDisplay(displayManager)
+        ) {
+            isUnplugExitArmed = true
+        }
+    }
+
+    private val confirmUnplugExitRunnable = Runnable {
+        isUnplugConfirmationPending = false
+        if (isDestroyed || isFinishing) return@Runnable
+        if (CursorOverlayManager.hasConnectedExternalDisplay(displayManager)) {
+            syncWindowFlagsIfInteractive()
+            scheduleArmUnplugExitIfNeeded()
+        } else if (isUnplugExitArmed) {
+            exitAppOnDisplayUnplugged()
+        }
+    }
+
+    private val serviceUnplugCallback: () -> Unit = {
+        onPotentialExternalDisplayUnplugged()
+    }
+
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {
+            if (CursorOverlayManager.hasConnectedExternalDisplay(displayManager)) {
+                onExternalDisplayDetected()
+            }
+        }
+
+        override fun onDisplayRemoved(displayId: Int) {
+            if (displayId != Display.DEFAULT_DISPLAY &&
+                !CursorOverlayManager.hasConnectedExternalDisplay(displayManager)
+            ) {
+                onPotentialExternalDisplayUnplugged()
+            }
+        }
+
+        override fun onDisplayChanged(displayId: Int) {
+            if (CursorOverlayManager.hasConnectedExternalDisplay(displayManager)) {
+                onExternalDisplayDetected()
+            }
+        }
+    }
+
+    private val screenOffReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == Intent.ACTION_SCREEN_OFF) {
+                // Guarantee phone window focusability and soft keyboard showMode are restored
+                // immediately as the screen turns off so Keyguard/lockscreen is never blocked.
+                restoreNormalPhoneWindowFlags()
+                TouchpadAccessibilityService.setMainActivityStarted(false)
+            }
+        }
+    }
 
     override fun onStart() {
         super.onStart()
+        if (CursorOverlayManager.hasConnectedExternalDisplay(displayManager)) {
+            onExternalDisplayDetected()
+        } else if (isUnplugExitArmed) {
+            onPotentialExternalDisplayUnplugged()
+        }
+
+        isActivityStarted = true
         TouchpadAccessibilityService.setMainActivityStarted(true)
+        syncWindowFlagsIfInteractive()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (!isExitingFromUnplug) {
+            syncWindowFlagsIfInteractive()
+        }
+    }
+
+    override fun onPause() {
+        val powerManager = getSystemService(PowerManager::class.java)
+        val keyguardManager = getSystemService(KeyguardManager::class.java)
+        if (powerManager?.isInteractive == false || keyguardManager?.isKeyguardLocked == true) {
+            restoreNormalPhoneWindowFlags()
+            TouchpadAccessibilityService.setMainActivityStarted(false)
+        }
+        super.onPause()
     }
 
     override fun onStop() {
+        isActivityStarted = false
+        restoreNormalPhoneWindowFlags()
         if (!isChangingConfigurations) {
             TouchpadAccessibilityService.setMainActivityStarted(false)
         }
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        mainHandler.removeCallbacks(armUnplugExitRunnable)
+        mainHandler.removeCallbacks(confirmUnplugExitRunnable)
+        if (::displayManager.isInitialized) {
+            runCatching { displayManager.unregisterDisplayListener(displayListener) }
+        }
+        if (isScreenOffReceiverRegistered) {
+            isScreenOffReceiverRegistered = false
+            runCatching { unregisterReceiver(screenOffReceiver) }
+        }
+        if (TouchpadAccessibilityService.onExternalDisplayUnpluggedListener === serviceUnplugCallback) {
+            TouchpadAccessibilityService.onExternalDisplayUnpluggedListener = null
+        }
+        restoreNormalPhoneWindowFlags()
+        super.onDestroy()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -110,25 +233,35 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         gestureController.attachContext(this)
 
+        displayManager = getSystemService(DisplayManager::class.java)
+        if (CursorOverlayManager.findExternalDisplay(displayManager) != null) {
+            // Display was already active before opening the app.
+            isUnplugExitArmed = true
+        } else if (CursorOverlayManager.hasConnectedExternalDisplay(displayManager)) {
+            scheduleArmUnplugExitIfNeeded()
+        }
+
+        displayManager.registerDisplayListener(displayListener, mainHandler)
+        TouchpadAccessibilityService.onExternalDisplayUnpluggedListener = serviceUnplugCallback
+
+        registerReceiver(screenOffReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
+        isScreenOffReceiverRegistered = true
+
         setContent {
             MaterialTheme(colorScheme = OledDimColorScheme) {
                 TouchpadScreen(
                     gestureController = gestureController,
+                    onExternalDisplayConnected = {
+                        onExternalDisplayDetected()
+                    },
                     onSetKeepScreenOn = { keepOn ->
-                        if (keepOn) {
-                            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                        } else {
-                            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                        }
+                        desiredKeepScreenOn = keepOn
+                        applyKeepScreenOn(keepOn)
                     },
                     onSetWindowFocusable = { focusable ->
-                        if (appliedWindowFocusable != focusable) {
-                            appliedWindowFocusable = focusable
-                            if (focusable) {
-                                window.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
-                            } else {
-                                window.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
-                            }
+                        desiredWindowFocusable = focusable
+                        if (isActivityStarted) {
+                            syncWindowFlagsIfInteractive()
                         }
                     },
                     onOpenSettings = {
@@ -138,11 +271,137 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    private fun onExternalDisplayDetected() {
+        if (isExitingFromUnplug) return
+        if (isUnplugConfirmationPending) {
+            isUnplugConfirmationPending = false
+            mainHandler.removeCallbacks(confirmUnplugExitRunnable)
+            syncWindowFlagsIfInteractive()
+        }
+        scheduleArmUnplugExitIfNeeded()
+    }
+
+    private fun scheduleArmUnplugExitIfNeeded() {
+        if (isUnplugExitArmed) return
+        mainHandler.removeCallbacks(armUnplugExitRunnable)
+        mainHandler.postDelayed(armUnplugExitRunnable, UNPLUG_ARM_STABILIZE_MS)
+    }
+
+    private fun onPotentialExternalDisplayUnplugged() {
+        mainHandler.removeCallbacks(armUnplugExitRunnable)
+        if (!isUnplugExitArmed || isExitingFromUnplug) return
+        if (CursorOverlayManager.hasConnectedExternalDisplay(displayManager)) return
+
+        // Restore normal phone window flags immediately so locking right after unplugging is safe,
+        // then confirm after a short debounce that no Desktop Mode replacement display appeared.
+        isUnplugConfirmationPending = true
+        restoreNormalPhoneWindowFlags()
+        TouchpadAccessibilityService.instance?.syncSoftKeyboardMode()
+
+        mainHandler.removeCallbacks(confirmUnplugExitRunnable)
+        mainHandler.postDelayed(confirmUnplugExitRunnable, UNPLUG_CONFIRM_DELAY_MS)
+    }
+
+    private fun applyWindowFocusable(focusable: Boolean) {
+        if (isExitingFromUnplug && !focusable) return
+        if (appliedWindowFocusable != focusable) {
+            appliedWindowFocusable = focusable
+            if (focusable) {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+            } else {
+                window.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+            }
+        }
+    }
+
+    private fun applyKeepScreenOn(keepOn: Boolean) {
+        if (isExitingFromUnplug && keepOn) return
+        if (keepOn) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    private fun restoreNormalPhoneWindowFlags() {
+        appliedWindowFocusable = true
+        window.clearFlags(
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+        )
+    }
+
+    private fun syncWindowFlagsIfInteractive() {
+        if (isExitingFromUnplug || isUnplugConfirmationPending || !isActivityStarted) {
+            if (isUnplugConfirmationPending || isExitingFromUnplug) {
+                restoreNormalPhoneWindowFlags()
+            }
+            return
+        }
+        val powerManager = getSystemService(PowerManager::class.java)
+        val keyguardManager = getSystemService(KeyguardManager::class.java)
+        if (powerManager?.isInteractive == false || keyguardManager?.isKeyguardLocked == true) {
+            restoreNormalPhoneWindowFlags()
+            return
+        }
+        applyWindowFocusable(desiredWindowFocusable)
+        applyKeepScreenOn(desiredKeepScreenOn)
+    }
+
+    private fun exitAppOnDisplayUnplugged() {
+        if (isExitingFromUnplug || isFinishing || isDestroyed) return
+        isExitingFromUnplug = true
+        isUnplugConfirmationPending = false
+        mainHandler.removeCallbacks(armUnplugExitRunnable)
+        mainHandler.removeCallbacks(confirmUnplugExitRunnable)
+        val wasStarted = isActivityStarted
+        isActivityStarted = false
+
+        restoreNormalPhoneWindowFlags()
+
+        runCatching {
+            val imm = getSystemService(InputMethodManager::class.java)
+            imm?.hideSoftInputFromWindow(window.decorView.windowToken, 0)
+        }
+
+        TouchpadAccessibilityService.setMainActivityStarted(false)
+        TouchpadAccessibilityService.notifyExternalDisplayUnplugged()
+
+        val keyguardManager = getSystemService(KeyguardManager::class.java)
+        val powerManager = getSystemService(PowerManager::class.java)
+        val canNavigateHome = wasStarted &&
+            (keyguardManager?.isKeyguardLocked != true) &&
+            (powerManager?.isInteractive != false)
+
+        if (canNavigateHome) {
+            runCatching {
+                val homeIntent = Intent(Intent.ACTION_MAIN).apply {
+                    addCategory(Intent.CATEGORY_HOME)
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                }
+                val options = ActivityOptions.makeBasic()
+                    .setLaunchDisplayId(Display.DEFAULT_DISPLAY)
+                startActivity(homeIntent, options.toBundle())
+            }
+        }
+
+        finishAndRemoveTask()
+    }
+
+    companion object {
+        /** Stabilization window after plugging in before unplug-to-exit is armed. */
+        private const val UNPLUG_ARM_STABILIZE_MS = 1800L
+
+        /** Debounce window to ignore transient Mirror -> Desktop display swaps while connected. */
+        private const val UNPLUG_CONFIRM_DELAY_MS = 650L
+    }
 }
 
 @Composable
 fun TouchpadScreen(
     gestureController: GestureController,
+    onExternalDisplayConnected: () -> Unit,
     onSetKeepScreenOn: (Boolean) -> Unit,
     onSetWindowFocusable: (Boolean) -> Unit,
     onOpenSettings: () -> Unit
@@ -151,6 +410,12 @@ fun TouchpadScreen(
     val externalDisplay by TouchpadAccessibilityService.externalDisplay.collectAsState()
     val isDragging by TouchpadAccessibilityService.isDragging.collectAsState()
     val textSession by TouchpadAccessibilityService.textSession.collectAsState()
+
+    LaunchedEffect(externalDisplay) {
+        if (externalDisplay != null) {
+            onExternalDisplayConnected()
+        }
+    }
 
     var showDisclosure by remember { mutableStateOf(false) }
     var showOptions by remember { mutableStateOf(false) }
