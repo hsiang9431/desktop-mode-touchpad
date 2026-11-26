@@ -2,6 +2,8 @@
 
 A Samsung DeX-style phone touchpad and native Gboard text-input bridge for **Android Desktop Mode** on connected external displays — requiring **no Root, no ADB, and no Shizuku**.
 
+> **Note**: Everything in this repository (source code, resources, icons, and documentation) was generated with **Gemini 4 Carbon**.
+
 ---
 
 ## Features
@@ -71,3 +73,9 @@ app/src/main/
    Output APK: `app/build/outputs/apk/debug/app-debug.apk`
 3. Install on your phone, tap **Enable Accessibility Service**, accept the disclosure, and enable **Desktop Touchpad Service** in Android Accessibility Settings.
 4. Connect an external USB-C / HDMI / wireless Desktop Mode display (either before or after launching the app). Unplugging the external display automatically exits the touchpad app.
+
+---
+
+## License
+
+Released under the [MIT License](LICENSE). Everything in this project was generated with **Gemini 4 Carbon**.
