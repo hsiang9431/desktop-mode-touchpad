@@ -12,7 +12,6 @@ import android.os.SystemClock
 import android.text.InputType
 import android.view.Display
 import android.view.KeyEvent
-import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
 import android.view.inputmethod.EditorInfo
@@ -50,13 +49,11 @@ class ExternalTextBridge(
     private val _session = MutableStateFlow<ExternalTextSession?>(null)
     val session: StateFlow<ExternalTextSession?> = _session.asStateFlow()
 
-    // Last user-clicked position & quietly observed editable node on the external display
+    // Last user-clicked position on the external display (quietly recorded, never opens keyboard)
     private var lastTapDisplayId: Int = Display.INVALID_DISPLAY
     private var lastTapPoint: PointF? = null
-    private var lastObservedExternalEditable: AccessibilityNodeInfo? = null
-    private var lastObservedDisplayId: Int = Display.INVALID_DISPLAY
 
-    // Snapshot of the selected external text box captured when the user taps/opens
+    // Snapshot of the selected external text box captured when the user opens/retaps
     private var targetNode: AccessibilityNodeInfo? = null
     private var targetDisplayId: Int = Display.INVALID_DISPLAY
     private var targetPackage: String? = null
@@ -91,37 +88,22 @@ class ExternalTextBridge(
         }
     }
 
-    private val quietPreCaptureAfterTapRunnable: Runnable = Runnable {
-        if (_session.value != null) return@Runnable
-        val tapPt = lastTapPoint ?: return@Runnable
-        val displayId = lastTapDisplayId
-        if (displayId == Display.INVALID_DISPLAY) return@Runnable
-
-        // Capture the editable AccessibilityNodeInfo while the external display STILL holds window focus!
-        val hitMatch = findEditableAtPointAcrossWindows(displayId, tapPt.x.toInt(), tapPt.y.toInt(), slopPx = 12)
-        val focusedMatch = findFocusedEditableOnDisplay(displayId)
-        val candidate = hitMatch?.first ?: focusedMatch?.first
-        if (candidate != null) {
-            lastObservedExternalEditable = candidate
-            lastObservedDisplayId = displayId
-        }
-    }
-
     private val postTapRefreshRunnable: Runnable = Runnable {
         val current = _session.value ?: return@Runnable
         val tapPt = lastTapPoint ?: return@Runnable
         if (lastTapDisplayId == Display.INVALID_DISPLAY) return@Runnable
 
-        val resolvedWin = captureTargetAt(
+        captureTargetAt(
             activeExternalDisplayId = lastTapDisplayId,
             fallbackX = tapPt.x,
-            fallbackY = tapPt.y,
+            fallbackY = tapPt.y
         )
 
         val updatedHint = extractHint(targetNode)
+        val hitWin = findTopWindowAtPoint(lastTapDisplayId, tapPt.x.toInt(), tapPt.y.toInt())
         val updatedLabel = resolveTargetLabel(
             packageName = targetPackage.orEmpty(),
-            windowTitle = resolvedWin?.title?.toString(),
+            windowTitle = hitWin?.title?.toString()
         )
 
         onAllowPhoneSoftKeyboard()
@@ -129,7 +111,7 @@ class ExternalTextBridge(
             displayId = lastTapDisplayId,
             targetLabel = updatedLabel,
             hintText = updatedHint,
-            refocusTrigger = refocusCounter.incrementAndGet(),
+            refocusTrigger = refocusCounter.incrementAndGet()
         )
     }
 
@@ -168,8 +150,6 @@ class ExternalTextBridge(
         cancelPendingCallbacks()
         pendingAction = null
         targetNode = null
-        lastObservedExternalEditable = null
-        lastObservedDisplayId = Display.INVALID_DISPLAY
         targetPackage = null
         hasModifiedTargetInSession = false
         lastTapDisplayId = Display.INVALID_DISPLAY
@@ -189,48 +169,13 @@ class ExternalTextBridge(
         mainHandler.removeCallbacks(fallbackSetTextRunnable)
         mainHandler.removeCallbacks(restorePhoneKeyboardRunnable)
         mainHandler.removeCallbacks(postTapRefreshRunnable)
-        mainHandler.removeCallbacks(quietPreCaptureAfterTapRunnable)
-    }
-
-    /**
-     * Quietly caches any editable node focused/clicked on the external display while the external
-     * display has focus (e.g. Chrome Omnibox url_bar, WebView <input>, Compose TextField).
-     * NEVER opens or dismisses the keyboard automatically.
-     */
-    fun onAccessibilityEventQuiet(event: AccessibilityEvent, activeExternalDisplayId: Int) {
-        if (activeExternalDisplayId == Display.INVALID_DISPLAY) return
-        val pkg = event.packageName?.toString().orEmpty()
-        if (pkg.isEmpty() || pkg == service.packageName || pkg == "com.android.systemui") return
-
-        val type = event.eventType
-        if (type != AccessibilityEvent.TYPE_VIEW_FOCUSED &&
-            type != AccessibilityEvent.TYPE_VIEW_CLICKED
-        ) {
-            return
-        }
-
-        val src = event.source ?: return
-        val srcWinDisplayId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            src.window?.displayId ?: Display.INVALID_DISPLAY
-        } else {
-            activeExternalDisplayId
-        }
-        if (srcWinDisplayId != activeExternalDisplayId && srcWinDisplayId != Display.INVALID_DISPLAY) {
-            return
-        }
-
-        if (isEditableNode(src)) {
-            lastObservedExternalEditable = src
-            lastObservedDisplayId = activeExternalDisplayId
-            if (_session.value != null && targetNode == null) {
-                targetNode = src
-            }
-        }
     }
 
     /**
      * Called right BEFORE dispatching a user tap on the external display.
-     * Never auto-opens the keyboard; quietly snapshots the editable node after the tap lands.
+     * When the phone keyboard session is closed, keeps external onscreen keyboard suppressed.
+     * When the phone keyboard session is open, updates the selected target box and keeps the
+     * phone keyboard focused without toggling SHOW_MODE_HIDDEN (avoiding any Gboard flicker).
      */
     fun onBeforeExternalTap(displayId: Int, x: Float, y: Float) {
         if (displayId == Display.INVALID_DISPLAY) return
@@ -239,8 +184,6 @@ class ExternalTextBridge(
 
         if (_session.value == null) {
             onSuppressExternalSoftKeyboard()
-            mainHandler.removeCallbacks(quietPreCaptureAfterTapRunnable)
-            mainHandler.postDelayed(quietPreCaptureAfterTapRunnable, 110L)
         } else {
             externalTapTransitionUntilUptimeMs = SystemClock.uptimeMillis() + 350L
             mainHandler.removeCallbacks(postTapRefreshRunnable)
@@ -274,7 +217,7 @@ class ExternalTextBridge(
         val hint = extractHint(targetNode)
         val label = resolveTargetLabel(
             packageName = targetPackage.orEmpty(),
-            windowTitle = resolvedWin?.title?.toString(),
+            windowTitle = resolvedWin?.title?.toString()
         )
 
         onAllowPhoneSoftKeyboard()
@@ -294,24 +237,14 @@ class ExternalTextBridge(
         fallbackX: Float,
         fallbackY: Float,
     ): AccessibilityWindowInfo? {
-        val hitMatch = findEditableAtPointAcrossWindows(
-            displayId = activeExternalDisplayId,
-            x = fallbackX.toInt(),
-            y = fallbackY.toInt(),
-            slopPx = 14,
-        )
         val focusedMatch = findFocusedEditableOnDisplay(activeExternalDisplayId)
-        val preCaptured = lastObservedExternalEditable?.takeIf {
-            lastObservedDisplayId == activeExternalDisplayId &&
-                it.refresh() &&
-                isEditableNode(it)
+        val hitWin = findTopWindowAtPoint(activeExternalDisplayId, fallbackX.toInt(), fallbackY.toInt())
+        val hitNode = hitWin?.root?.let {
+            hitTestEditableNode(it, fallbackX.toInt(), fallbackY.toInt(), slopPx = 10, depth = 0)
         }
 
-        val resolvedNode = hitMatch?.first ?: focusedMatch?.first ?: preCaptured
-        val resolvedWin = hitMatch?.second
-            ?: focusedMatch?.second
-            ?: resolvedNode?.window
-            ?: findTopApplicationWindowAtPoint(activeExternalDisplayId, fallbackX.toInt(), fallbackY.toInt())
+        val resolvedNode = hitNode ?: focusedMatch?.first
+        val resolvedWin = if (hitNode != null) hitWin else (focusedMatch?.second ?: hitWin)
 
         targetNode = resolvedNode
         targetDisplayId = activeExternalDisplayId
@@ -368,6 +301,11 @@ class ExternalTextBridge(
             })
     }
 
+    /**
+     * Forces the user's typed text straight into the selected text box on the external display.
+     * Uses direct AccessibilityNodeInfo actions first so the phone never loses window focus
+     * and Gboard never flickers.
+     */
     fun forceInputIntoSelectedBox(
         text: String,
         sendEnterAfter: Boolean,
@@ -396,6 +334,9 @@ class ExternalTextBridge(
         executeFlickerFreeOrFallback(action)
     }
 
+    /**
+     * Clears all text inside the selected external text box without closing or flickering Gboard.
+     */
     fun clearSelectedBox() {
         val displayId = targetDisplayId
         if (displayId == Display.INVALID_DISPLAY) return
@@ -411,6 +352,9 @@ class ExternalTextBridge(
         executeFlickerFreeOrFallback(action)
     }
 
+    /**
+     * Deletes one character inside the selected external text box without closing or flickering Gboard.
+     */
     fun sendBackspaceToSelectedBox() {
         val displayId = targetDisplayId
         if (displayId == Display.INVALID_DISPLAY) return
@@ -427,17 +371,26 @@ class ExternalTextBridge(
         executeFlickerFreeOrFallback(action)
     }
 
+    /**
+     * Primary path: execute directly on the external AccessibilityNodeInfo while the phone
+     * retains 100% of window & IME focus (zero Gboard dip/flicker).
+     * Fallback path: only used for non-accessibility surfaces (e.g. raw canvas/terminal).
+     */
     private fun executeFlickerFreeOrFallback(action: PendingForceInputAction) {
+        // 1. If API 33+ InputMethod somehow already has an active external connection (e.g. per-display focus), use it directly.
         if (executeDirectImeCommitIfConnected(action)) {
             markTargetModifiedAfterAction(action)
             return
         }
 
+        // 2. Primary flicker-free path: perform ACTION_SET_TEXT / ACTION_IME_ENTER directly on the external node
+        // without changing SoftKeyboardController mode and without tapping away phone window focus!
         val directResult = tryDirectAccessibilityNodeAction(action)
         if (directResult == DirectNodeResult.COMPLETE) {
             return
         }
 
+        // If text was already inserted via ACTION_SET_TEXT and only single-line Enter remained unhandled:
         val remainingAction = if (directResult == DirectNodeResult.TEXT_DONE_NEEDS_ENTER) {
             action.copy(
                 textToInsert = null,
@@ -548,6 +501,7 @@ class ExternalTextBridge(
             ?: return DirectNodeResult.UNSUPPORTED
         node.refresh()
 
+        // Appending/deleting on an already-populated masked password box cannot read existing plaintext via AccessibilityNodeInfo
         if (node.isPassword && !action.clearAllText) {
             val needsExistingPasswordText = action.appendAtEnd || action.deleteBeforeLength > 0
             if (needsExistingPasswordText) {
@@ -691,17 +645,10 @@ class ExternalTextBridge(
             return saved
         }
 
-        val preCaptured = lastObservedExternalEditable
-        if (preCaptured != null &&
-            lastObservedDisplayId == displayId &&
-            preCaptured.refresh() &&
-            isEditableNode(preCaptured)
-        ) {
-            targetNode = preCaptured
-            return preCaptured
+        val win = findTopWindowAtPoint(displayId, anchorX.toInt(), anchorY.toInt())
+        val hit = win?.root?.let {
+            hitTestEditableNode(it, anchorX.toInt(), anchorY.toInt(), slopPx = 12, depth = 0)
         }
-
-        val hit = findEditableAtPointAcrossWindows(displayId, anchorX.toInt(), anchorY.toInt(), slopPx = 14)?.first
         if (hit != null) {
             targetNode = hit
             return hit
@@ -720,18 +667,20 @@ class ExternalTextBridge(
         displayId: Int,
     ): Pair<AccessibilityNodeInfo, AccessibilityWindowInfo>? {
         val windows = getExternalWindows(displayId)
-        for (win in windows) {
+        val orderedForFocus = windows.sortedWith(
+            compareByDescending<AccessibilityWindowInfo> { it.isFocused }
+                .thenByDescending { it.isActive }
+                .thenByDescending { it.layer }
+        )
+        for (win in orderedForFocus) {
             val root = win.root ?: continue
-            val inputFocused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-            if (inputFocused != null) {
-                if (isEditableNode(inputFocused)) {
-                    return Pair(inputFocused, win)
-                }
-                val budget = intArrayOf(800)
-                val inner = findFocusedEditableDescendant(inputFocused, depth = 0, budget = budget)
-                if (inner != null) {
-                    return Pair(inner, win)
-                }
+            val inputFocused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: continue
+            if (isEditableNode(inputFocused)) {
+                return Pair(inputFocused, win)
+            }
+            val inner = findFocusedEditableDescendant(inputFocused, depth = 0)
+            if (inner != null) {
+                return Pair(inner, win)
             }
         }
         return null
@@ -740,23 +689,20 @@ class ExternalTextBridge(
     private fun findFocusedEditableDescendant(
         node: AccessibilityNodeInfo,
         depth: Int,
-        budget: IntArray,
     ): AccessibilityNodeInfo? {
-        if (depth > 90 || budget[0] <= 0) return null
-        budget[0]--
-
+        if (depth > 24) return null
         for (i in node.childCount - 1 downTo 0) {
             val child = node.getChild(i) ?: continue
-            if (isEditableNode(child) && (child.isFocused || child.isAccessibilityFocused)) {
+            if (isEditableNode(child) && child.isFocused) {
                 return child
             }
-            val sub = findFocusedEditableDescendant(child, depth + 1, budget)
+            val sub = findFocusedEditableDescendant(child, depth + 1)
             if (sub != null) return sub
         }
         return null
     }
 
-    private fun findTopApplicationWindowAtPoint(
+    private fun findTopWindowAtPoint(
         displayId: Int,
         x: Int,
         y: Int,
@@ -768,60 +714,31 @@ class ExternalTextBridge(
         }
     }
 
-    /**
-     * Searches ALL application windows first (bypassing full-screen SystemUI TYPE_SYSTEM overlays)
-     * and returns the deepest/smallest editable AccessibilityNodeInfo containing (x, y).
-     */
-    private fun findEditableAtPointAcrossWindows(
-        displayId: Int,
-        x: Int,
-        y: Int,
-        slopPx: Int,
-    ): Pair<AccessibilityNodeInfo, AccessibilityWindowInfo>? {
-        val winBounds = Rect()
-        for (win in getExternalWindows(displayId)) {
-            win.getBoundsInScreen(winBounds)
-            if (!winBounds.contains(x, y)) continue
-            val root = win.root ?: continue
-            val budget = intArrayOf(900)
-            val hit = hitTestEditableNode(root, x, y, slopPx, depth = 0, budget = budget)
-            if (hit != null) {
-                return Pair(hit, win)
-            }
-        }
-        return null
-    }
-
     private fun hitTestEditableNode(
         node: AccessibilityNodeInfo,
         x: Int,
         y: Int,
         slopPx: Int,
         depth: Int,
-        budget: IntArray,
     ): AccessibilityNodeInfo? {
-        if (depth > 90 || budget[0] <= 0) return null
-        budget[0]--
-
-        // Do NOT abort child traversal when a wrapper container (e.g. HTML <div> or unclipped ViewGroup)
-        // has empty/non-matching bounds; always inspect children in reverse z-order first.
-        for (i in node.childCount - 1 downTo 0) {
-            if (budget[0] <= 0) break
-            val child = node.getChild(i) ?: continue
-            val childHit = hitTestEditableNode(child, x, y, slopPx, depth + 1, budget)
-            if (childHit != null) return childHit
-        }
-
-        if (!isEditableNode(node)) return null
+        if (depth > 30 || !node.isVisibleToUser) return null
         val bounds = Rect()
         node.getBoundsInScreen(bounds)
         if (bounds.isEmpty) return null
         bounds.inset(-slopPx, -slopPx)
-        return if (bounds.contains(x, y)) node else null
+        if (!bounds.contains(x, y)) return null
+
+        for (i in node.childCount - 1 downTo 0) {
+            val child = node.getChild(i) ?: continue
+            val childHit = hitTestEditableNode(child, x, y, slopPx, depth + 1)
+            if (childHit != null) return childHit
+        }
+
+        return if (isEditableNode(node)) node else null
     }
 
     private fun isEditableNode(node: AccessibilityNodeInfo): Boolean {
-        if (!node.isEnabled) return false
+        if (!node.isEnabled || !node.isVisibleToUser) return false
         return node.isEditable ||
             node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_SET_TEXT }
     }
@@ -835,25 +752,14 @@ class ExternalTextBridge(
                 service.windows
             }
 
-        // Prioritize TYPE_APPLICATION windows above TYPE_SYSTEM windows so full-screen
-        // SystemUI Desktop Mode overlays never shadow the actual app window underneath!
         return rawWindows
             .asSequence()
             .filter { win ->
-                val pkg = win.root?.packageName?.toString()
                 (win.type == AccessibilityWindowInfo.TYPE_APPLICATION ||
                     win.type == AccessibilityWindowInfo.TYPE_SYSTEM) &&
-                    pkg != service.packageName &&
-                    pkg != "com.android.systemui"
+                    win.root?.packageName?.toString() != service.packageName
             }
-            .sortedWith(
-                compareByDescending<AccessibilityWindowInfo> {
-                    it.type == AccessibilityWindowInfo.TYPE_APPLICATION
-                }
-                    .thenByDescending { it.isFocused }
-                    .thenByDescending { it.isActive }
-                    .thenByDescending { it.layer },
-            )
+            .sortedByDescending { it.layer }
             .toList()
     }
 
