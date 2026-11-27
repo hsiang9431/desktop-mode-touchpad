@@ -3,6 +3,7 @@ package com.example.desktoptouchpad.overlay
 import android.accessibilityservice.AccessibilityService
 import android.content.Context
 import android.graphics.PixelFormat
+import android.graphics.drawable.Animatable
 import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Handler
@@ -10,6 +11,7 @@ import android.os.Looper
 import android.util.DisplayMetrics
 import android.view.Display
 import android.view.Gravity
+import android.view.PointerIcon
 import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.widget.ImageView
@@ -27,27 +29,80 @@ data class ExternalDisplayInfo(
     val height: Int
 )
 
+const val POINTER_ICON_TYPE_HANDWRITING_COMPAT = 1022
+const val POINTER_ICON_TYPE_SPOT_HOVER_COMPAT = 2000
+const val POINTER_ICON_TYPE_SPOT_TOUCH_COMPAT = 2001
+const val POINTER_ICON_TYPE_SPOT_ANCHOR_COMPAT = 2002
+
 enum class CursorStyle(
     @DrawableRes val drawableRes: Int,
     val hotspotXFraction: Float,
     val hotspotYFraction: Float,
+    val pointerIconType: Int,
 ) {
-    ARROW(R.drawable.ic_cursor, 4.5f / 24f, 3.5f / 24f),
-    HAND(R.drawable.ic_cursor_hand, 9.5f / 24f, 2.5f / 24f),
-    TEXT(R.drawable.ic_cursor_text, 12f / 24f, 11f / 24f),
-    GRABBING(R.drawable.ic_cursor_grabbing, 8.5f / 24f, 7.5f / 24f),
-    ALL_SCROLL(R.drawable.ic_cursor_all_scroll, 12f / 24f, 12f / 24f),
-    CONTEXT_MENU(R.drawable.ic_cursor_context_menu, 4.5f / 24f, 3.5f / 24f),
-    RESIZE_HORIZONTAL(R.drawable.ic_cursor_resize_horizontal, 12f / 24f, 12f / 24f),
-    RESIZE_VERTICAL(R.drawable.ic_cursor_resize_vertical, 12f / 24f, 12f / 24f),
-    RESIZE_DIAG_NW_SE(R.drawable.ic_cursor_resize_diag_nw_se, 12f / 24f, 12f / 24f),
-    RESIZE_DIAG_NE_SW(R.drawable.ic_cursor_resize_diag_ne_sw, 12f / 24f, 12f / 24f);
+    ARROW(R.drawable.ic_cursor, 4.5f / 24f, 3.5f / 24f, PointerIcon.TYPE_ARROW),
+    CONTEXT_MENU(R.drawable.ic_cursor_context_menu, 4.5f / 24f, 3.5f / 24f, PointerIcon.TYPE_CONTEXT_MENU),
+    HAND(R.drawable.ic_cursor_hand, 9.5f / 24f, 2.5f / 24f, PointerIcon.TYPE_HAND),
+    HELP(R.drawable.ic_cursor_help, 4.5f / 24f, 3.5f / 24f, PointerIcon.TYPE_HELP),
+    WAIT(R.drawable.ic_cursor_wait, 12f / 24f, 12f / 24f, PointerIcon.TYPE_WAIT),
+    CELL(R.drawable.ic_cursor_cell, 12f / 24f, 12f / 24f, PointerIcon.TYPE_CELL),
+    CROSSHAIR(R.drawable.ic_cursor_crosshair, 12f / 24f, 12f / 24f, PointerIcon.TYPE_CROSSHAIR),
+    TEXT(R.drawable.ic_cursor_text, 12f / 24f, 11f / 24f, PointerIcon.TYPE_TEXT),
+    VERTICAL_TEXT(R.drawable.ic_cursor_vertical_text, 12f / 24f, 12f / 24f, PointerIcon.TYPE_VERTICAL_TEXT),
+    ALIAS(R.drawable.ic_cursor_alias, 11.5f / 24f, 11.5f / 24f, PointerIcon.TYPE_ALIAS),
+    COPY(R.drawable.ic_cursor_copy, 8.5f / 24f, 7.5f / 24f, PointerIcon.TYPE_COPY),
+    NO_DROP(R.drawable.ic_cursor_nodrop, 8.5f / 24f, 7.5f / 24f, PointerIcon.TYPE_NO_DROP),
+    ALL_SCROLL(R.drawable.ic_cursor_all_scroll, 12f / 24f, 12f / 24f, PointerIcon.TYPE_ALL_SCROLL),
+    RESIZE_HORIZONTAL(
+        R.drawable.ic_cursor_resize_horizontal,
+        12f / 24f,
+        12f / 24f,
+        PointerIcon.TYPE_HORIZONTAL_DOUBLE_ARROW,
+    ),
+    RESIZE_VERTICAL(
+        R.drawable.ic_cursor_resize_vertical,
+        12f / 24f,
+        12f / 24f,
+        PointerIcon.TYPE_VERTICAL_DOUBLE_ARROW,
+    ),
+    RESIZE_DIAG_NE_SW(
+        R.drawable.ic_cursor_resize_diag_ne_sw,
+        12f / 24f,
+        12f / 24f,
+        PointerIcon.TYPE_TOP_RIGHT_DIAGONAL_DOUBLE_ARROW,
+    ),
+    RESIZE_DIAG_NW_SE(
+        R.drawable.ic_cursor_resize_diag_nw_se,
+        12f / 24f,
+        12f / 24f,
+        PointerIcon.TYPE_TOP_LEFT_DIAGONAL_DOUBLE_ARROW,
+    ),
+    ZOOM_IN(R.drawable.ic_cursor_zoom_in, 10.5f / 24f, 9.5f / 24f, PointerIcon.TYPE_ZOOM_IN),
+    ZOOM_OUT(R.drawable.ic_cursor_zoom_out, 10.5f / 24f, 9.5f / 24f, PointerIcon.TYPE_ZOOM_OUT),
+    GRAB(R.drawable.ic_cursor_grab, 9.5f / 24f, 4.5f / 24f, PointerIcon.TYPE_GRAB),
+    GRABBING(R.drawable.ic_cursor_grabbing, 8.5f / 24f, 7.5f / 24f, PointerIcon.TYPE_GRABBING),
+    HANDWRITING(
+        R.drawable.ic_cursor_handwriting,
+        8.25f / 24f,
+        23.75f / 24f,
+        POINTER_ICON_TYPE_HANDWRITING_COMPAT,
+    ),
+    SPOT_HOVER(R.drawable.ic_cursor_spot_hover, 12f / 24f, 12f / 24f, POINTER_ICON_TYPE_SPOT_HOVER_COMPAT),
+    SPOT_TOUCH(R.drawable.ic_cursor_spot_touch, 12f / 24f, 12f / 24f, POINTER_ICON_TYPE_SPOT_TOUCH_COMPAT),
+    SPOT_ANCHOR(R.drawable.ic_cursor_spot_anchor, 12f / 24f, 12f / 24f, POINTER_ICON_TYPE_SPOT_ANCHOR_COMPAT);
 
     val isResizeCursor: Boolean
         get() = this == RESIZE_HORIZONTAL ||
             this == RESIZE_VERTICAL ||
             this == RESIZE_DIAG_NW_SE ||
             this == RESIZE_DIAG_NE_SW
+
+    companion object {
+        @Suppress("unused")
+        fun fromPointerIconType(type: Int): CursorStyle {
+            return entries.firstOrNull { it.pointerIconType == type } ?: ARROW
+        }
+    }
 }
 
 class CursorOverlayManager(
@@ -76,6 +131,7 @@ class CursorOverlayManager(
     private var appliedStyle: CursorStyle = CursorStyle.ARROW
     private var hoverStyle: CursorStyle = CursorStyle.ARROW
     private var dragResizeStyle: CursorStyle? = null
+    private var pinchZoomStyle: CursorStyle? = null
     private var isDraggingActive = false
     private var isScrollingActive = false
     private var isContextClickActive = false
@@ -175,6 +231,7 @@ class CursorOverlayManager(
         appliedStyle = CursorStyle.ARROW
         hoverStyle = CursorStyle.ARROW
         dragResizeStyle = null
+        pinchZoomStyle = null
         isDraggingActive = false
         isScrollingActive = false
         isContextClickActive = false
@@ -356,6 +413,15 @@ class CursorOverlayManager(
         refreshEffectiveCursorStyle()
     }
 
+    fun setPinchZoomVisual(zoomStyle: CursorStyle?) {
+        val normalized = zoomStyle?.takeIf {
+            it == CursorStyle.ZOOM_IN || it == CursorStyle.ZOOM_OUT
+        }
+        if (pinchZoomStyle == normalized) return
+        pinchZoomStyle = normalized
+        refreshEffectiveCursorStyle()
+    }
+
     fun notifyContextClickVisual() {
         mainHandler.removeCallbacks(clearContextVisualRunnable)
         if (!isContextClickActive) {
@@ -370,13 +436,18 @@ class CursorOverlayManager(
         val desired = when {
             isDraggingActive -> dragResizeStyle ?: CursorStyle.GRABBING
             isContextClickActive -> CursorStyle.CONTEXT_MENU
+            pinchZoomStyle != null -> pinchZoomStyle!!
             isScrollingActive -> CursorStyle.ALL_SCROLL
             else -> hoverStyle
         }
         if (desired == appliedStyle) return
         appliedStyle = desired
         updateHotspotOffsetsForStyle(desired)
-        cursorView?.setImageResource(desired.drawableRes)
+        cursorView?.let { view ->
+            (view.drawable as? Animatable)?.stop()
+            view.setImageResource(desired.drawableRes)
+            (view.drawable as? Animatable)?.start()
+        }
         applyCursorLayout()
     }
 
@@ -403,6 +474,7 @@ class CursorOverlayManager(
     private fun detachOverlay() {
         mainHandler.removeCallbacks(clearContextVisualRunnable)
         cursorView?.let { view ->
+            (view.drawable as? Animatable)?.stop()
             try {
                 windowManager?.removeView(view)
             } catch (_: Exception) {
@@ -416,6 +488,7 @@ class CursorOverlayManager(
         isScrollingActive = false
         isContextClickActive = false
         dragResizeStyle = null
+        pinchZoomStyle = null
         hoverStyle = CursorStyle.ARROW
         appliedStyle = CursorStyle.ARROW
         activeDisplayId = Display.INVALID_DISPLAY

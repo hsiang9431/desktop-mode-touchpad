@@ -791,6 +791,9 @@ class TouchpadAccessibilityService : AccessibilityService() {
         pendingPinchScale = (pendingPinchScale * initialScaleFactor)
             .coerceIn(MIN_PENDING_PINCH_SCALE, MAX_PENDING_PINCH_SCALE)
         isPinchRequested = true
+        overlayManager.setPinchZoomVisual(
+            if (initialScaleFactor < 0.998f) CursorStyle.ZOOM_OUT else CursorStyle.ZOOM_IN
+        )
 
         if ((activePinchStroke1 != null) &&
             (activePinchStroke2 != null) &&
@@ -810,8 +813,14 @@ class TouchpadAccessibilityService : AccessibilityService() {
         pendingPinchScale = (pendingPinchScale * scaleFactor)
             .coerceIn(MIN_PENDING_PINCH_SCALE, MAX_PENDING_PINCH_SCALE)
 
-        if (isPinchRequested && (activePinchStroke1 == null || activePinchStroke2 == null)) {
-            beginPinchStroke(displayId)
+        if (isPinchRequested) {
+            when {
+                scaleFactor > 1.002f -> overlayManager.setPinchZoomVisual(CursorStyle.ZOOM_IN)
+                scaleFactor < 0.998f -> overlayManager.setPinchZoomVisual(CursorStyle.ZOOM_OUT)
+            }
+            if (activePinchStroke1 == null || activePinchStroke2 == null) {
+                beginPinchStroke(displayId)
+            }
         }
     }
 
@@ -1127,6 +1136,9 @@ class TouchpadAccessibilityService : AccessibilityService() {
         activePinchStroke2 = null
         pendingPinchScale = 1f
         pinchDisplayId = Display.INVALID_DISPLAY
+        if (::overlayManager.isInitialized) {
+            overlayManager.setPinchZoomVisual(null)
+        }
     }
 
     /**
@@ -1622,6 +1634,15 @@ class TouchpadAccessibilityService : AccessibilityService() {
                 nodeBounds.height() in 4..(displayHeight / 2)
 
             if (isBoundedControl) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S_V2) {
+                    val hasDragStart = node.actionList.any {
+                        it.id == AccessibilityNodeInfo.AccessibilityAction.ACTION_DRAG_START.id
+                    }
+                    if (hasDragStart) {
+                        return CursorStyle.GRAB
+                    }
+                }
+
                 val isClickableControl = node.isClickable ||
                     node.isCheckable ||
                     node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_CLICK }
@@ -1634,6 +1655,12 @@ class TouchpadAccessibilityService : AccessibilityService() {
                 }
                 if (hasContextClick) {
                     return CursorStyle.CONTEXT_MENU
+                }
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+                    !node.tooltipText.isNullOrBlank()
+                ) {
+                    return CursorStyle.HELP
                 }
             }
         }

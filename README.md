@@ -9,7 +9,7 @@ A Samsung DeX-style phone touchpad and native Gboard text-input bridge for **And
 ## Features
 
 ### Desktop Trackpad & Pointer
-- **Android 14 Dynamic Cursors**: Automatically detects connected secondary displays (`DisplayManager`) and renders Android 14 desktop vector cursors (`WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY`) via `CursorOverlayManager`, dynamically switching between arrow, hand pointer, text I-beam, grabbing hand, all-scroll, context menu, and horizontal/vertical/diagonal freeform window resize cursors with exact hotspot alignment.
+- **Android 14+ Full AOSP Vector Cursor Set**: Automatically detects connected secondary displays (`DisplayManager`) and renders the complete 25-icon AOSP desktop vector cursor set (`WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY`) via `CursorOverlayManager`, dynamically switching across arrow, hand, text/vertical-text I-beams, grab/grabbing hands, copy/alias/no-drop badges, help, animated wait spinner, cell/crosshair, zoom in/out, all-scroll, context menu, stylus handwriting, spot hover/touch/anchor, and horizontal/vertical/diagonal freeform window resize cursors with exact AOSP hotspot alignment.
 - **Multi-Touch Gestures, Action Bar & Persistent Options**:
   - **1-finger move & tap**: DeX-style velocity-accelerated pointer movement and left-click on the external screen, with an adjustable **Pointer Sensitivity** slider (`0.5×`–`3.5×`).
   - **Hold-to-Drag (Release-Locked)**: Engage drag via **tap & hold** on the touchpad (configurable **Tap & Hold Delay** slider from `200 ms`–`600 ms`) or holding the **Click / Drag** button. Continuous stroke chaining (`StrokeDescription.continueStroke`) and drag-owner tracking ensure dragging only ends when every finger holding the drag lifts.
