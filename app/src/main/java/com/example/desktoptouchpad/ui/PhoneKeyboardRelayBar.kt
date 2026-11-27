@@ -139,15 +139,21 @@ private fun requestPhoneSoftKeyboard(activity: Activity?, editText: RelayEditTex
 }
 
 private fun hidePhoneSoftKeyboard(activity: Activity?, editText: RelayEditText?) {
-    if (editText == null) return
-    editText.isClosingKeyboard = true
-    editText.pendingShowSoftInputOnWindowFocus = false
-    val imm = editText.context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-    imm.hideSoftInputFromWindow(editText.windowToken, 0)
-    activity?.window?.let { win ->
-        WindowCompat.getInsetsController(win, editText).hide(WindowInsetsCompat.Type.ime())
+    if (editText != null) {
+        editText.isClosingKeyboard = true
+        editText.pendingShowSoftInputOnWindowFocus = false
     }
-    editText.clearFocus()
+    val token = editText?.windowToken ?: activity?.window?.decorView?.windowToken
+    if (token != null) {
+        val ctx = editText?.context ?: activity
+        val imm = ctx?.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+        imm?.hideSoftInputFromWindow(token, 0)
+    }
+    activity?.window?.let { win ->
+        WindowCompat.getInsetsController(win, editText ?: win.decorView)
+            .hide(WindowInsetsCompat.Type.ime())
+    }
+    editText?.clearFocus()
 }
 
 @Composable
@@ -171,6 +177,12 @@ fun PhoneKeyboardRelayBar(
         TouchpadAccessibilityService.instance?.allowPhoneSoftKeyboard()
         delay(30.milliseconds)
         requestPhoneSoftKeyboard(activity, view)
+        delay(220.milliseconds)
+        val imeNowVisible = ViewCompat.getRootWindowInsets(view)
+            ?.isVisible(WindowInsetsCompat.Type.ime()) == true
+        if (!view.isClosingKeyboard && !imeNowVisible) {
+            requestPhoneSoftKeyboard(activity, view)
+        }
     }
 
     // Detect when the user manually hides Gboard using Gboard's bottom-left downward arrow
@@ -220,10 +232,19 @@ fun PhoneKeyboardRelayBar(
         val typedText = view.text?.toString().orEmpty()
         if (typedText.isEmpty() && !sendEnterAfter) return
         view.text?.clear()
-        TouchpadAccessibilityService.instance?.forceInputIntoSelectedBox(
-            text = typedText,
-            sendEnterAfter = sendEnterAfter,
-        )
+        if (sendEnterAfter) {
+            hidePhoneSoftKeyboard(activity, view)
+        }
+        val service = TouchpadAccessibilityService.instance
+        if (service != null) {
+            service.forceInputIntoSelectedBox(
+                text = typedText,
+                sendEnterAfter = sendEnterAfter,
+                closeKeyboardAfter = sendEnterAfter,
+            )
+        } else if (sendEnterAfter) {
+            onDismissKeyboard()
+        }
     }
 
     Card(

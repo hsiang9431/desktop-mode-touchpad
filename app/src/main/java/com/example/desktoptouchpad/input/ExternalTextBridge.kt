@@ -115,6 +115,21 @@ class ExternalTextBridge(
         )
     }
 
+    private var pendingAutoOpenDisplayId: Int = Display.INVALID_DISPLAY
+    private var pendingAutoOpenX: Float = 0f
+    private var pendingAutoOpenY: Float = 0f
+
+    private val autoOpenAfterTapRunnable: Runnable = Runnable {
+        val displayId = pendingAutoOpenDisplayId
+        pendingAutoOpenDisplayId = Display.INVALID_DISPLAY
+        if ((displayId == Display.INVALID_DISPLAY) || (_session.value != null)) return@Runnable
+        openManualKeyboard(
+            activeExternalDisplayId = displayId,
+            cursorX = pendingAutoOpenX,
+            cursorY = pendingAutoOpenY,
+        )
+    }
+
     private val typeNullGraceRunnable: Runnable = Runnable {
         val action = pendingAction ?: return@Runnable
         pendingAction = null
@@ -171,7 +186,31 @@ class ExternalTextBridge(
         onSuppressExternalSoftKeyboard()
     }
 
+    private fun closeSessionPreservingPendingAction() {
+        cancelPendingAutoOpen()
+        mainHandler.removeCallbacks(restorePhoneKeyboardRunnable)
+        mainHandler.removeCallbacks(postTapRefreshRunnable)
+        _session.value = null
+        onSuppressExternalSoftKeyboard()
+    }
+
+    fun cancelPendingAutoOpen() {
+        pendingAutoOpenDisplayId = Display.INVALID_DISPLAY
+        mainHandler.removeCallbacks(autoOpenAfterTapRunnable)
+    }
+
+    fun scheduleAutoOpenAfterExternalTap(displayId: Int, x: Float, y: Float) {
+        if (displayId == Display.INVALID_DISPLAY || _session.value != null) return
+        cancelPendingAutoOpen()
+        pendingAutoOpenDisplayId = displayId
+        pendingAutoOpenX = x
+        pendingAutoOpenY = y
+        externalTapTransitionUntilUptimeMs = SystemClock.uptimeMillis() + 350L
+        mainHandler.postDelayed(autoOpenAfterTapRunnable, 65L)
+    }
+
     private fun cancelPendingCallbacks() {
+        cancelPendingAutoOpen()
         mainHandler.removeCallbacks(typeNullGraceRunnable)
         mainHandler.removeCallbacks(fallbackSetTextRunnable)
         mainHandler.removeCallbacks(restorePhoneKeyboardRunnable)
@@ -186,6 +225,7 @@ class ExternalTextBridge(
      */
     fun onBeforeExternalTap(displayId: Int, x: Float, y: Float) {
         if (displayId == Display.INVALID_DISPLAY) return
+        cancelPendingAutoOpen()
         lastTapDisplayId = displayId
         lastTapPoint = PointF(x, y)
 
@@ -199,7 +239,8 @@ class ExternalTextBridge(
     }
 
     /**
-     * Called ONLY when the user explicitly taps the Keyboard button on the phone.
+     * Called when opening the phone keyboard (either manually via the Keyboard button or
+     * automatically after clicking with a text-editing cursor).
      */
     fun openManualKeyboard(
         activeExternalDisplayId: Int,
@@ -207,6 +248,7 @@ class ExternalTextBridge(
         cursorY: Float,
     ): Boolean {
         if (activeExternalDisplayId == Display.INVALID_DISPLAY) return false
+        cancelPendingAutoOpen()
 
         val tapPt = lastTapPoint
         val fallbackX = if (lastTapDisplayId == activeExternalDisplayId && tapPt != null) {
@@ -316,10 +358,21 @@ class ExternalTextBridge(
     fun forceInputIntoSelectedBox(
         text: String,
         sendEnterAfter: Boolean,
+        closeKeyboardAfter: Boolean = false,
     ) {
         val displayId = targetDisplayId
-        if (displayId == Display.INVALID_DISPLAY) return
-        if (text.isEmpty() && !sendEnterAfter) return
+        if (displayId == Display.INVALID_DISPLAY) {
+            if (closeKeyboardAfter) {
+                dismissKeyboardSession()
+            }
+            return
+        }
+        if (text.isEmpty() && !sendEnterAfter) {
+            if (closeKeyboardAfter) {
+                dismissKeyboardSession()
+            }
+            return
+        }
 
         val hadSelection = targetInitialSelStart in 0..<targetInitialSelEnd
 
@@ -337,6 +390,10 @@ class ExternalTextBridge(
             initialCursorPos = targetInitialSelEnd,
             editorAction = targetEditorAction,
         )
+
+        if (closeKeyboardAfter) {
+            closeSessionPreservingPendingAction()
+        }
 
         executeFlickerFreeOrFallback(action)
     }
@@ -755,7 +812,9 @@ class ExternalTextBridge(
 
     private fun isEditableNode(node: AccessibilityNodeInfo): Boolean {
         if (!node.isEnabled || !node.isVisibleToUser) return false
+        val cls = node.className?.toString().orEmpty()
         return node.isEditable ||
+            cls.contains("EditText", ignoreCase = true) ||
             node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_SET_TEXT }
     }
 

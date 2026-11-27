@@ -104,6 +104,9 @@ class TouchpadAccessibilityService : AccessibilityService() {
     }
 
     private var lastHoverDispatchUptimeMs = 0L
+    private var cursorPositionVersion = 0L
+    private var inspectedCursorPositionVersion = 0L
+    private var tapAutoOpenGeneration = 0L
     private val isHoverInspectionRunning = AtomicBoolean(false)
     private val deferredHoverCheckRunnable = Runnable {
         dispatchHoverInspectionNow()
@@ -190,6 +193,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
     }
 
     private fun cleanup() {
+        cancelPendingTapAutoOpen()
         mainHandler.removeCallbacks(deferredHoverCheckRunnable)
         resetDragState()
         resetScrollState()
@@ -210,6 +214,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
     }
 
     internal fun handleExternalDisplayDisconnected(notifyActivityListener: Boolean = true) {
+        cancelPendingTapAutoOpen()
         mainHandler.removeCallbacks(deferredHoverCheckRunnable)
         isPhoneKeyboardAllowed = false
         resetDragState()
@@ -265,13 +270,20 @@ class TouchpadAccessibilityService : AccessibilityService() {
         applySoftKeyboardShowMode(SHOW_MODE_AUTO)
     }
 
+    private fun cancelPendingTapAutoOpen() {
+        tapAutoOpenGeneration++
+        externalTextBridge.cancelPendingAutoOpen()
+    }
+
     fun requestManualKeyboard(): Boolean {
+        cancelPendingTapAutoOpen()
         val displayId = activeTargetDisplayId() ?: return false
         val (cursorX, cursorY) = getCursorPosition()
         return externalTextBridge.openManualKeyboard(displayId, cursorX, cursorY)
     }
 
     fun dismissKeyboardSession() {
+        cancelPendingTapAutoOpen()
         isPhoneKeyboardAllowed = false
         externalTextBridge.dismissKeyboardSession()
     }
@@ -279,10 +291,16 @@ class TouchpadAccessibilityService : AccessibilityService() {
     fun forceInputIntoSelectedBox(
         text: String,
         sendEnterAfter: Boolean,
+        closeKeyboardAfter: Boolean = false,
     ) {
+        if (closeKeyboardAfter) {
+            cancelPendingTapAutoOpen()
+            isPhoneKeyboardAllowed = false
+        }
         externalTextBridge.forceInputIntoSelectedBox(
             text = text,
             sendEnterAfter = sendEnterAfter,
+            closeKeyboardAfter = closeKeyboardAfter,
         )
     }
 
@@ -300,6 +318,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
 
     fun moveCursor(deltaX: Float, deltaY: Float) {
         if (!::overlayManager.isInitialized) return
+        cursorPositionVersion++
         overlayManager.updateCursorPosition(deltaX, deltaY)
         if (!hasActiveContinuousGesture()) {
             throttledHoverInspectionOnMove()
@@ -308,6 +327,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
 
     fun centerCursor() {
         if (!::overlayManager.isInitialized) return
+        cursorPositionVersion++
         overlayManager.centerCursor()
         scheduleHoverInspection(delayMs = 30L)
     }
@@ -339,17 +359,85 @@ class TouchpadAccessibilityService : AccessibilityService() {
         if (isAnotherGestureRequested()) return false
         clearFinishedAuxiliaryGestures()
 
+        val gen = ++tapAutoOpenGeneration
         val (clampedX, clampedY) = clampToDisplay(x, y)
+        val isSessionCurrentlyClosed = (_textSession.value == null)
+        val isCursorStyleFresh = (inspectedCursorPositionVersion == cursorPositionVersion)
+        val needsFreshCursorCheck = isSessionCurrentlyClosed &&
+            !isCursorStyleFresh &&
+            (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
+
+        var tapCompleted = false
+        var styleResolved = !needsFreshCursorCheck
+        var clickedWithTextCursor = overlayManager.isTextEditingCursor()
+
+        fun tryAutoOpenKeyboardAfterTap() {
+            if (gen != tapAutoOpenGeneration) return
+            if (!tapCompleted || !styleResolved) return
+            if (clickedWithTextCursor &&
+                (_textSession.value == null) &&
+                isMainActivityStarted &&
+                (activeTargetDisplayId() == displayId)
+            ) {
+                externalTextBridge.scheduleAutoOpenAfterExternalTap(displayId, clampedX, clampedY)
+            }
+        }
+
+        if (needsFreshCursorCheck) {
+            val capturedPosVersion = cursorPositionVersion
+            val (dispW, dispH) = overlayManager.getDisplayDimensions()
+            serviceScope.launch(Dispatchers.Default) {
+                val resolvedStyle = runCatching {
+                    resolveCursorStyleAt(
+                        displayId = displayId,
+                        x = clampedX.toInt(),
+                        y = clampedY.toInt(),
+                        displayWidth = dispW,
+                        displayHeight = dispH,
+                    )
+                }.getOrNull()
+                mainHandler.post {
+                    if (resolvedStyle != null &&
+                        ::overlayManager.isInitialized &&
+                        activeTargetDisplayId() == displayId
+                    ) {
+                        overlayManager.setHoverCursorStyle(resolvedStyle)
+                        if (capturedPosVersion == cursorPositionVersion) {
+                            inspectedCursorPositionVersion = capturedPosVersion
+                        }
+                    }
+                    if (gen == tapAutoOpenGeneration) {
+                        clickedWithTextCursor = resolvedStyle?.isTextCursor ?: clickedWithTextCursor
+                        styleResolved = true
+                        tryAutoOpenKeyboardAfterTap()
+                    }
+                }
+            }
+        }
+
         externalTextBridge.onBeforeExternalTap(displayId, clampedX, clampedY)
         val path = Path().apply { moveTo(clampedX, clampedY) }
         val stroke = GestureDescription.StrokeDescription(path, 0L, TAP_DURATION_MS)
         val dispatched = dispatchGesture(
             createGestureBuilder(displayId).addStroke(stroke).build(),
-            null,
-            null
+            object : GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    scheduleHoverInspection(delayMs = 135L)
+                    if (gen != tapAutoOpenGeneration) return
+                    tapCompleted = true
+                    tryAutoOpenKeyboardAfterTap()
+                }
+
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    if (gen == tapAutoOpenGeneration) {
+                        cancelPendingTapAutoOpen()
+                    }
+                }
+            },
+            mainHandler,
         )
-        if (dispatched) {
-            scheduleHoverInspection(delayMs = 180L)
+        if (!dispatched && gen == tapAutoOpenGeneration) {
+            cancelPendingTapAutoOpen()
         }
         return dispatched
     }
@@ -369,6 +457,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
     fun performContextClick(x: Float, y: Float): Boolean {
         val displayId = activeTargetDisplayId() ?: return false
         if (isAnotherGestureRequested()) return false
+        cancelPendingTapAutoOpen()
         clearFinishedAuxiliaryGestures()
 
         if (_textSession.value == null) {
@@ -399,6 +488,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
         val displayId = activeTargetDisplayId() ?: return false
         if (isDragRequested) return true
 
+        cancelPendingTapAutoOpen()
         if (_textSession.value == null) {
             suppressExternalSoftKeyboard()
         }
@@ -541,6 +631,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
     fun startScroll(initialDeltaX: Float = 0f, initialDeltaY: Float = 0f): Boolean {
         val displayId = activeTargetDisplayId() ?: return false
         if (isDragActive() || isPinchRequested) return false
+        cancelPendingTapAutoOpen()
         if (activePinchStroke1 != null || activePinchStroke2 != null) {
             resetPinchState()
         }
@@ -780,6 +871,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
     fun startPinch(initialScaleFactor: Float = 1f): Boolean {
         val displayId = activeTargetDisplayId() ?: return false
         if (isDragActive() || isScrollRequested) return false
+        cancelPendingTapAutoOpen()
         if (activeScrollStroke != null) {
             resetScrollState()
         }
@@ -1147,6 +1239,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
      */
     fun performBack(): Boolean {
         val displayId = activeTargetDisplayId() ?: return false
+        cancelPendingTapAutoOpen()
         if (_textSession.value == null) {
             suppressExternalSoftKeyboard()
         }
@@ -1188,6 +1281,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
      */
     fun performHome(): Boolean {
         val displayId = activeTargetDisplayId() ?: return false
+        cancelPendingTapAutoOpen()
         if (_textSession.value == null) {
             suppressExternalSoftKeyboard()
         }
@@ -1217,6 +1311,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
      */
     fun performAppSwitch(): Boolean {
         val displayId = activeTargetDisplayId() ?: return false
+        cancelPendingTapAutoOpen()
         if (_textSession.value == null) {
             suppressExternalSoftKeyboard()
         }
@@ -1493,6 +1588,7 @@ class TouchpadAccessibilityService : AccessibilityService() {
         if (!isHoverInspectionRunning.compareAndSet(false, true)) return
 
         lastHoverDispatchUptimeMs = SystemClock.uptimeMillis()
+        val capturedVersion = cursorPositionVersion
         val (cursorX, cursorY) = overlayManager.getCursorCoordinates()
         val (dispW, dispH) = overlayManager.getDisplayDimensions()
 
@@ -1508,6 +1604,9 @@ class TouchpadAccessibilityService : AccessibilityService() {
                 mainHandler.post {
                     if (::overlayManager.isInitialized && activeTargetDisplayId() == displayId) {
                         overlayManager.setHoverCursorStyle(style)
+                        if (capturedVersion == cursorPositionVersion) {
+                            inspectedCursorPositionVersion = capturedVersion
+                        }
                     }
                 }
             } catch (_: Exception) {

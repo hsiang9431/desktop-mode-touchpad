@@ -9,7 +9,7 @@ This document explains how `AndroidDesktopTouchpad` delivers native phone Gboard
 1. **Single Global Window Focus on Multi-Display Phones (`config_perDisplayFocusEnabled = false`)**
    - On standard Android phones without root/system privileges, only one display window holds global window and `InputMethodManagerService` (IMMS) focus at a time.
    - Typing happens locally in `RelayEditText` on the phone (`Display.DEFAULT_DISPLAY`) with zero external focus changes so Gboard never interrupts multi-character or CJK composition.
-   - When an external action (**Insert**, **Insert + Enter**, or external **Clear** / **⌫**) targets an external surface via `AccessibilityService.InputMethod` (`Api33InputMethodBridge`), focus briefly moves to the external display to commit onto its `InputConnection` and immediately returns to `MainActivity` on the phone (`scheduleRestorePhoneKeyboard`). As an Android OS consequence of global single-window focus, Gboard briefly hides during that ~100ms external commit and automatically reopens on the phone.
+   - When an external action (**Insert**, **Insert + Enter**, or external **Clear** / **⌫**) targets an external surface via `AccessibilityService.InputMethod` (`Api33InputMethodBridge`), focus moves to the external display to commit onto its `InputConnection`. **Insert** and external **Clear** / **⌫** immediately return focus to `MainActivity` on the phone (`scheduleRestorePhoneKeyboard`), whereas **Insert + Enter** closes the phone keyboard session after submitting.
 
 2. **`SoftKeyboardController` Global Policy (`InputMethodManagerService`)**
    - `AccessibilityService.SoftKeyboardController.setShowMode(SHOW_MODE_HIDDEN)` sets `Settings.Secure.ACCESSIBILITY_SOFT_KEYBOARD_MODE = 1` (`mA11yRequestingNoSoftKeyboard = true` in `IMMS`).
@@ -22,9 +22,10 @@ This document explains how `AndroidDesktopTouchpad` delivers native phone Gboard
 
 ## Core Design
 
-### 1. Manual Keyboard Activation Only
-- Tapping on the external display (`TouchpadAccessibilityService.performTap`) records `(displayId, x, y)` in `ExternalTextBridge.onBeforeExternalTap` and **never** auto-opens the phone keyboard.
-- The phone keyboard opens **only** when the user taps **Keyboard** (`ExternalTextBridge.openManualKeyboard`).
+### 1. Text-Cursor Click & Manual Keyboard Activation
+- Tapping on the external display (`TouchpadAccessibilityService.performTap`) records `(displayId, x, y)` in `ExternalTextBridge.onBeforeExternalTap` while keeping `SHOW_MODE_HIDDEN` active during the tap so no external onscreen keyboard flashes.
+- If the pointer is a text-editing cursor (`CursorStyle.TEXT` or `CursorStyle.VERTICAL_TEXT`), `ExternalTextBridge.scheduleAutoOpenAfterExternalTap` automatically opens the phone keyboard once the external tap lands; otherwise, regular arrow/hand clicks never auto-open the phone keyboard.
+- The phone keyboard can also be opened or closed manually at any time via **Keyboard** (`ExternalTextBridge.openManualKeyboard` / `dismissKeyboardSession`), and **Insert + Enter** automatically closes the keyboard after submitting.
 
 ### 2. External Onscreen Keyboard Suppression (`SoftKeyboardController`)
 - **When Phone Keyboard Session is Closed (`textSession == null`)** and `MainActivity` is started with an external display connected:

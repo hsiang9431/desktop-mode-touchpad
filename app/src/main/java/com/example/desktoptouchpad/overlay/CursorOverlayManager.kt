@@ -97,6 +97,9 @@ enum class CursorStyle(
             this == RESIZE_DIAG_NW_SE ||
             this == RESIZE_DIAG_NE_SW
 
+    val isTextCursor: Boolean
+        get() = this == TEXT || this == VERTICAL_TEXT
+
     companion object {
         @Suppress("unused")
         fun fromPointerIconType(type: Int): CursorStyle {
@@ -464,6 +467,8 @@ class CursorOverlayManager(
     }
 
     fun getCursorCoordinates(): Pair<Float, Float> = Pair(cursorX, cursorY)
+
+    fun isTextEditingCursor(): Boolean = appliedStyle.isTextCursor || hoverStyle.isTextCursor
 
     fun getDisplayDimensions(): Pair<Int, Int> = Pair(displayWidth, displayHeight)
 
